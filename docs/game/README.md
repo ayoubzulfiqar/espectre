@@ -126,7 +126,7 @@ Sent over BLE notify when requested and at client connect.
 proto_version=1
 chip=esp32c6
 threshold=1.20 (auto)
-window=75
+window=100
 END
 ```
 
@@ -144,6 +144,8 @@ END
 | `hampel_threshold` | Hampel threshold |
 | `traffic_rate` | Traffic generator rate (packets/sec) |
 | `publish_interval` | ESPectre publish interval (packets) |
+| `evaluation_interval` | Detector evaluation interval (packets) |
+| `motion_hits` | Motion enter/exit hit counters (`on/off`) |
 | `best_pxx` | Calibration baseline metric used for adaptive thresholding |
 | `proto_version` | Game BLE protocol version |
 | `END` | Marks end of system info block |
@@ -191,7 +193,7 @@ Sysinfo notification sequence:
 proto_version=1
 chip=esp32c6
 threshold=1.20 (auto)
-window=75
+window=100
 END
 ```
 

@@ -98,6 +98,9 @@ class ESpectreComponent : public Component {
     }
   }
   void set_publish_interval(uint32_t interval) { this->publish_interval_ = interval; }
+  void set_evaluation_interval(uint32_t interval) { this->evaluation_interval_ = interval; }
+  void set_motion_on_hits(uint8_t hits) { this->motion_on_hits_ = hits; }
+  void set_motion_off_hits(uint8_t hits) { this->motion_off_hits_ = hits; }
   void set_lowpass_enabled(bool enabled) { this->lowpass_enabled_ = enabled; }
   void set_lowpass_cutoff(float cutoff) { this->lowpass_cutoff_ = cutoff; }
   void set_hampel_enabled(bool enabled) { this->hampel_enabled_ = enabled; }
@@ -171,11 +174,14 @@ class ESpectreComponent : public Component {
   
   // Configuration from YAML
   float segmentation_threshold_{1.0f};
-  uint16_t segmentation_window_size_{75};
+  uint16_t segmentation_window_size_{100};
   uint32_t traffic_generator_rate_{100};
-  TrafficGeneratorMode traffic_generator_mode_{TrafficGeneratorMode::DNS};
+  TrafficGeneratorMode traffic_generator_mode_{TrafficGeneratorMode::PING};
   GainLockMode gain_lock_mode_{GainLockMode::AUTO};
   uint32_t publish_interval_{100};  // Publish interval in packets (default: same as traffic_generator_rate)
+  uint32_t evaluation_interval_{25};
+  uint8_t motion_on_hits_{3};
+  uint8_t motion_off_hits_{3};
   bool lowpass_enabled_{false};     // Low-pass filter disabled by default
   float lowpass_cutoff_{11.0f};     // Default cutoff frequency in Hz
   bool hampel_enabled_{true};

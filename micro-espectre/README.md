@@ -59,7 +59,7 @@ This fork makes CSI-based applications accessible to Python developers and enabl
 | **Motion Detection** |
 | MVS Detector | ✅ | ✅ | Moving Variance Segmentation (default) |
 | ML Detector | ✅ | ✅ | Neural Network (experimental) |
-| ML Features (12) | ✅ | ✅ | mean, std, max, min, zcr, skewness, kurtosis, entropy, autocorr, mad, slope, delta |
+| ML Features (9) | ✅ | ✅ | mean, std, max, min, iqr, skewness, autocorr, mad, waveform_length |
 | **Calibration (MVS only)** |
 | NBVI | ✅ | ✅ | 12 non-consecutive subcarriers |
 | Adaptive Threshold | ✅ | ✅ | P95 × 1.1 of baseline variance |
@@ -131,6 +131,7 @@ The `me` CLI provides these essential commands:
 | `deploy` | Deploy Python code to device | `./me deploy` |
 | `run` | Run the application | `./me run` |
 | `stream` | Stream raw CSI data via UDP | `./me stream --ip 192.168.1.100` |
+| `detect` | Run live ML motion detection on the PC | `./me detect --log-turbulence` |
 | `collect` | Collect labeled CSI data for ML training | `./me collect --label baseline --duration 10` |
 | `verify` | Verify firmware installation | `./me verify` |
 | `ui` | Open web monitoring interface in browser | `./me ui` |
@@ -152,6 +153,9 @@ The `me` CLI provides these essential commands:
 
 # For real-time CSI streaming (gesture detection, research)
 ./me stream --ip 192.168.1.100  # Stream to PC
+
+# On the PC, inspect live ML motion inference
+./me detect --log-turbulence
 ```
 
 > **Note**: The interactive mode (`./me` without arguments) provides advanced MQTT control features and is covered in detail in the [Interactive CLI (Advanced)](#interactive-cli-advanced) section.
@@ -350,7 +354,7 @@ pytest tests/test_segmentation.py::TestStateMachine -v
 |-------|------|------|-------|
 | `test_config` | Unit | — | Configuration constants, guard bands |
 | `test_filters` | Unit | Synthetic | Hampel, low-pass filters |
-| `test_features` | Unit | Synthetic | Feature extraction (entropy, skewness, kurtosis) |
+| `test_features` | Unit | Synthetic | Production ML feature extraction (9 inputs) |
 | `test_segmentation` | Unit | Synthetic | MVS state machine, variance calculation |
 | `test_segmentation_additional` | Unit | Synthetic | Additional segmentation edge cases |
 | `test_nbvi_calibrator` | Unit | **Real** | NBVI subcarrier selection |
@@ -399,8 +403,8 @@ DETECTION_ALGORITHM = "mvs"   # "mvs" (default) or "ml"
 
 | Algorithm | Method | Calibration | Boot Time |
 |-----------|--------|-------------|-----------|
-| **MVS** (default) | Moving Variance Segmentation of Turbulence | Subcarriers + Threshold | ~10s |
-| **ML** | Neural Network (12 features → MLP) | **None** (fixed subcarriers) | **~3s** |
+| **MVS** (default) | Moving Variance Segmentation of Turbulence | Subcarriers + Threshold | ~13s |
+| **ML** | Neural Network (9 features → MLP) | **None** (fixed subcarriers) | **~3s** |
 
 ### 3. Calibration Algorithm (MVS only)
 
@@ -418,8 +422,18 @@ CALIBRATION_ALGORITHM = "nbvi"  # NBVI is the sole calibration algorithm
 
 ```python
 SEG_THRESHOLD = "auto"     # "auto" (adaptive), "min" (max baseline), or 0.0-10.0
-SEG_WINDOW_SIZE = 75       # Moving variance window (10-200 packets)
+SEG_WINDOW_SIZE = 100      # Moving variance window (10-200 packets)
+PUBLISH_INTERVAL = 100     # Periodic MQTT/log publish cadence
+EVALUATION_INTERVAL = 25   # Detector evaluation cadence (independent from publish)
+MOTION_ON_HITS = 3         # Consecutive evaluated MOTION hits required to enter MOTION
+MOTION_OFF_HITS = 3        # Consecutive evaluated IDLE hits required to return to IDLE
 ```
+
+`SEG_WINDOW_SIZE` still defines the analysis window, while `EVALUATION_INTERVAL`
+controls how often the detector state machine is evaluated during runtime. The
+published MQTT payload remains periodic (`PUBLISH_INTERVAL`), but the reported
+`state` now reflects the filtered runtime state after the `MOTION_ON_HITS` /
+`MOTION_OFF_HITS` debounce logic has been applied.
 
 ### 5. Filters (Optional, MVS and ML)
 
@@ -454,6 +468,11 @@ The system publishes JSON payloads to the configured MQTT topic (default: `home/
 }
 ```
 
+The payload is emitted every `PUBLISH_INTERVAL` packets. Its `state` field is
+not the raw detector output of a single evaluation: it is the effective runtime
+state after evaluation every `EVALUATION_INTERVAL` packets and after the
+`MOTION_ON_HITS` / `MOTION_OFF_HITS` consecutive-hit filter.
+
 ## Analysis Tools
 
 The `tools/` directory contains Python scripts for CSI data analysis and algorithm validation.
@@ -469,7 +488,7 @@ Micro-ESPectre implements automatic subcarrier selection using the **NBVI** (Nor
 Both algorithms achieve high performance (>90% recall, <15% FP rate) with **zero manual configuration**.
 
 > ⚠️ **IMPORTANT**: Keep the room **quiet and still** after device boot during calibration:
-> - **MVS**: ~10 seconds (gain lock + band calibration)
+> - **MVS**: ~13 seconds (gain lock + band calibration)
 > - **ML**: ~3 seconds (gain lock only, no band calibration needed)
 
 For complete algorithm documentation, see [ALGORITHMS.md](ALGORITHMS.md#subcarrier-selection-nbvi).
@@ -480,12 +499,12 @@ Micro-ESPectre includes a **neural network-based motion detector** as an experim
 
 ### ML Detector (Experimental)
 
-The ML detector (`DETECTION_ALGORITHM = "ml"`) is a compact MLP trained on real CSI data. It extracts 12 statistical features from turbulence patterns and outputs a motion probability.
+The ML detector (`DETECTION_ALGORITHM = "ml"`) is a compact MLP trained on real CSI data. It extracts 9 turbulence-window features, including robust spread statistics such as `turb_iqr` and `turb_mad`, and outputs a motion probability.
 
 | Aspect | Details |
 |--------|---------|
-| Architecture | MLP (12 → 16 → 8 → 1) |
-| Input | 12 features from 75-packet window |
+| Architecture | MLP (9 → 24 → 12 → 1) |
+| Input | 9 features from 100-packet window |
 | Output | Probability (0.0 - 1.0), threshold at 0.5 |
 | Filters | Supports low-pass and Hampel filters (same as MVS) |
 | Performance | See [PERFORMANCE.md](../PERFORMANCE.md) for per-chip results |
@@ -704,7 +723,16 @@ Publish JSON commands to `home/espectre/node1/cmd`:
     "cmd_topic": "home/espectre/node1/cmd",
     "response_topic": "home/espectre/node1/response"
   },
-  "segmentation": {"threshold": 1.0, "window_size": 75},
+  "detection": {
+    "algorithm": "MVS",
+    "calibrator": "nbvi",
+    "threshold": 1.0,
+    "window_size": 100,
+    "publish_interval": 100,
+    "evaluation_interval": 25,
+    "motion_on_hits": 3,
+    "motion_off_hits": 3
+  },
   "subcarriers": {"indices": [6, 9, 10, 15, 18, 19, 30, 33, 36, 40, 49, 52]}
 }
 ```

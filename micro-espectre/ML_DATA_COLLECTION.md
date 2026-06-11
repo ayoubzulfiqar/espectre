@@ -9,7 +9,7 @@ This guide covers how to collect and label CSI data for training ML models. This
 | Feature | Status |
 |---------|--------|
 | Data collection infrastructure | ✅ Ready |
-| Feature extraction (12 features) | ✅ Ready |
+| Feature extraction (9 features) | ✅ Ready |
 | ML detector (MLP) | ✅ Ready |
 | Training script | ✅ Ready |
 | TFLite export | ✅ Ready |
@@ -26,10 +26,10 @@ This guide covers how to collect and label CSI data for training ML models. This
 - ESP32-C3
 - ESP32-C6
 
-**Works with CV normalization:**
-- ESP32 (original) - Does not support AGC gain lock, but can still be used for training with CV normalization enabled
+**Also supported:**
+- ESP32 (original) - Does not support AGC gain lock, but data is usable for ML training (raw std is used for all chips)
 
-> **Note**: AGC gain lock stabilizes CSI amplitudes during data collection. Without it, amplitudes vary with signal strength. Data collected without gain lock requires CV normalization (`std/mean`) during feature extraction to make detection gain-invariant. The training script handles this automatically using each file's `gain_locked` metadata.
+> **Note**: AGC gain lock stabilizes CSI amplitudes during data collection. Without it, amplitudes vary with signal strength. The ML training pipeline and MLDetector always use raw std (`σ`) for turbulence, regardless of gain lock status. CV normalization (`σ/μ`) is only used by MVS detection.
 
 ---
 
@@ -66,6 +66,20 @@ Start streaming CSI data from ESP32 to your PC:
 - 64 subcarriers (HT20 mode)
 - Sequence numbers for packet loss detection
 - ~100 packets/second
+
+### 4. Optional: Inspect Live ML Motion Detection
+
+If you want to validate runtime ML behavior before recording data, run live
+host-side inference from the UDP CSI stream:
+
+```bash
+./me detect --log-turbulence
+```
+
+`me detect` reads threshold, subcarriers, Hampel, low-pass, and hit filtering
+from `src/config.py` and `src/config_local.py`, just like the rest of
+micro-ESPectre. Use `--bind-ip <local_ip>` only when auto-detection picks the
+wrong interface.
 
 ---
 
@@ -267,12 +281,13 @@ Some ESP32 chips (original ESP32) or data collection sessions may not have AGC g
 
 ### How It Works
 
-Instead of excluding this data, the training script applies **CV normalization** (`std/mean`) during feature extraction. This normalizes spatial turbulence to be gain-invariant.
+The ML training script uses **raw std** for all chips, including those without gain lock. CV normalization is not applied during ML training or inference — it is only used by the MVS detector.
 
-### When to Use CV Normalization
+### When CV Normalization Is Applied
 
-- **ESP32 (original)**: Does not support AGC gain lock in the CSI driver
-- **Data collected before enabling gain lock**: Some C3 datasets were collected before gain lock was enabled
+CV normalization is only used by the **MVS detector**, not by ML:
+- **ESP32 (original)**: MVS uses CV normalization since AGC gain lock is not supported
+- **Data collected before enabling gain lock**: MVS applies CV normalization for older captures
 - **Future compatibility**: Any data where amplitudes are unreliable
 
 ### Automatic Detection
@@ -361,32 +376,47 @@ See [tools/README.md](tools/README.md) for complete documentation of all analysi
 Once you have collected labeled data, train the ML model:
 
 ```bash
-# Train model (default uses --fp-weight 2.0)
+# Train model (default uses --fp-weight 1.0, --scaler standard, --batch-size 32)
 python tools/10_train_ml_model.py
 
 # Show dataset info (including excluded files)
 python tools/10_train_ml_model.py --info
+
+# Compare alternate feature normalization modes
+python tools/10_train_ml_model.py --scaler clipped_standard
+
+# Optional chip-exclusion experiment
+python tools/10_train_ml_model.py --exclude-chip ESP32
 ```
 
-The `--fp-weight` parameter multiplies the IDLE class weight during training. Values >1.0 reduce false positives at the cost of slightly lower recall. Current default: `2.0` (production-oriented).
+The `--fp-weight` parameter multiplies the IDLE class weight during training. Values >1.0 reduce false positives at the cost of slightly lower recall. Current defaults: `--fp-weight 1.0`, `--scaler standard`, `--batch-size 32`.
 
 This will:
 1. Load all `.npz` files from `data/`
-2. Apply CV normalization to files with `gain_locked: false`
-3. Apply MVS-guided sample weighting on the default subcarrier set
-4. Extract 12 features per sliding window
-5. 5-fold cross-validation for reliable metrics
-6. Train MLP model (12 → 16 → 8 → 1) with early stopping and dropout
-7. Export to:
+2. Use raw std for all files (CV normalization disabled for ML)
+3. Apply context-aware MVS-guided sample weighting on the default subcarrier set
+4. Extract 9 features per sliding window
+5. Run grouped cross-validation by paired capture/session, with blocked scoring to reduce overlap optimism
+6. Report worst-group metrics (session, chip, source file) alongside mean fold metrics
+7. Train the selected MLP architecture with early stopping and dropout
+8. Export to:
    - `src/ml_weights.py` (MicroPython) - includes seed and timestamp
    - `components/espectre/ml_weights.h` (C++/ESPHome) - includes seed and timestamp
    - `models/motion_detector_small.tflite` (TFLite int8)
    - `models/feature_scaler.npz` (normalization params)
-   - `models/ml_test_data.npz` (test data for validation)
+   - `models/ml_test_data.npz` (blocked regression subset for inference validation)
 
 Use `--seed <number>` for reproducible training. The seed is saved in the generated weight files.
 
-> **Note**: Files with `gain_locked: false` automatically use CV normalization during feature extraction. Use `--info` to see which files are affected.
+> **Note**: The ML pipeline always uses raw std for turbulence, regardless of `gain_locked` status. CV normalization is only applied by the MVS detector at runtime.
+>
+> **Note**: `--exclude-chip` is an experiment knob for ablations and domain-isolation studies. The default training path keeps all supported chips in the dataset unless you explicitly exclude them.
+>
+> **Note**: `ml_test_data.npz` is an inference-regression artifact, not the primary model-selection metric. Architecture and scaler choices should follow the grouped blocked-CV report emitted by `10_train_ml_model.py`.
+>
+> **Tip**: `--scaler clipped_standard` and larger `--batch-size` values are available for exploratory sweeps, but should be validated against `tests/test_validation_real_data.py::TestPerformanceMetrics::test_ml_detection_accuracy` before being promoted to production artifacts.
+>
+> **Tip**: For production artifact promotion, prefer `python tools/10_train_ml_model.py --seed-search-until-improvement <N>` over a plain training run. A plain run always exports the current seed, while the seed-search flow only replaces artifacts after a strict grouped-CV improvement.
 
 ### Compare Detection Methods
 
@@ -448,7 +478,7 @@ Example (HT20, 64 SC):
   - 7 + 128 = 135 bytes
 ```
 
-The `gain_locked` flag indicates whether AGC gain lock was applied during data collection. If not set (0), CV normalization should be applied during feature extraction.
+The `gain_locked` flag indicates whether AGC gain lock was applied during data collection. MVS uses this flag to enable CV normalization when gain is not locked. ML ignores this flag and always uses raw std.
 
 Note: ESPectre uses HT20 mode (64 subcarriers) for consistent performance across all ESP32 variants. Chip type and gain lock status are automatically detected and included in each packet.
 

@@ -6,10 +6,12 @@ This document provides detailed performance metrics for ESPectre's motion detect
 
 ## Performance Targets
 
-| Metric | Target (all chips) | Rationale |
-|--------|--------------------|-----------|
-| Recall | >95% | Minimize missed detections |
-| FP Rate | <5% | Avoid false alarms |
+| Scope | Metric | Target | Rationale |
+|-------|--------|--------|-----------|
+| MVS / NBVI | Recall | >95% | Minimize missed detections |
+| MVS / NBVI | FP Rate | <5% | Avoid false alarms |
+| ML | Recall | >95% | All chips use raw std (CV normalization disabled for ML) |
+| ML | FP Rate | <5% | Avoid false alarms |
 
 --
 ### Test Configuration
@@ -18,25 +20,28 @@ Configuration used for all test results (unified across chips):
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Window Size | 75 | `DETECTOR_DEFAULT_WINDOW_SIZE` |
+| Window Size | 100 | `DETECTOR_DEFAULT_WINDOW_SIZE` |
 | Calibration | NBVI | Auto-selects 12 non-consecutive subcarriers |
 | Hampel Filter | ON | Enabled for both MVS and ML (window=7, threshold=5.0 MAD) |
 | Adaptive Threshold | Percentile-based | P95 × 1.1 (`DEFAULT_ADAPTIVE_FACTOR`) |
-| CV Normalization | Per-file | Based on `gain_locked` metadata (`false` => apply CV norm) |
+| CV Normalization | MVS only | Based on `gain_locked` metadata (`false` => apply CV norm for MVS) |
 
-CV normalization is applied per-file based on whether data was collected with AGC gain lock enabled. See Test Data section for details.
+CV normalization is applied per-file for MVS based on whether data was collected with AGC gain lock enabled. ML always uses raw std regardless of gain lock status (the model is trained on raw std).
 
 ---
 
-## Test Data
+## Training Dataset
+
+`micro-espectre/data/dataset_info.json` contains multiple baseline/movement captures per chip across different collection sessions and environments. The counts below are aggregated packet totals across all available training captures.
 
 | Chip | Baseline | Movement | Total | Gain Lock |
 |------|----------|----------|-------|-----------|
-| ESP32-C3 | 2684 | 2658 | 5342 | Yes |
-| ESP32-C5 | 2609 | 2607 | 5216 | Yes |
-| ESP32-C6 | 2697 | 2779 | 5476 | Yes |
-| ESP32-S3 | 2655 | 2670 | 5325 | Yes |
-| ESP32 | 2081 | 2189 | 4270 | No |
+| ESP32-C3 | 4094 | 4076 | 8170 | Yes |
+| ESP32-C5 | 4350 | 4336 | 8686 | Yes |
+| ESP32-C6 | 4755 | 4890 | 9645 | Yes |
+| ESP32-S3 | 4360 | 4375 | 8735 | Yes |
+| ESP32 | 4159 | 4083 | 8242 | No |
+| Total | 21718 | 21760 | 43478 | Mixed |
 
 Data location: `micro-espectre/data/`
 
@@ -50,37 +55,40 @@ source venv/bin/activate
 # C++
 cd test && pio test -f test_motion_detection -v
 
-# Python
-cd micro-espectre && pytest tests/test_validation_real_data.py -v
+# Python (real-data validation)
+cd micro-espectre && pytest tests/test_validation_real_data.py::TestPerformanceMetrics -v
+
+# Python (60-second long recordings, prints summary tables)
+cd micro-espectre && pytest tests/test_validation_long_recordings.py -v -s
 ```
 
 ---
 
 ## Current Results
 
-Results from C++ and Python tests follow the same trends (same algorithms, same data, same methodology), with small per-chip differences due to platform/runtime implementation details.
+**Last verified:** 2026-05-21 (v2.8.0)
 
 | Chip | Algorithm | Recall | Precision | FP Rate | F1-Score |
 |------|-----------|--------|-----------|---------|----------|
-| ESP32-C3 | MVS Default | 96.1% | 99.9% | 0.1% | 98.0% |
-| ESP32-C3 | MVS + NBVI | 96.5% | 100.0% | 0.0% | 98.2% |
-| ESP32-C3 | ML | 99.6% | 100.0% | 0.0% | 99.8% |
-| ESP32-C5 | MVS Default | 99.7% | 99.2% | 1.1% | 99.5% |
-| ESP32-C5 | MVS + NBVI | 99.1% | 100.0% | 0.0% | 99.6% |
+| ESP32-C3 | MVS Default | 98.5% | 100.0% | 0.0% | 99.3% |
+| ESP32-C3 | MVS + NBVI | 96.3% | 100.0% | 0.0% | 98.1% |
+| ESP32-C3 | ML | 100.0% | 100.0% | 0.0% | 100.0% |
+| ESP32-C5 | MVS Default | 99.4% | 100.0% | 0.0% | 99.7% |
+| ESP32-C5 | MVS + NBVI | 99.0% | 100.0% | 0.0% | 99.5% |
 | ESP32-C5 | ML | 100.0% | 100.0% | 0.0% | 100.0% |
-| ESP32-C6 | MVS Default | 98.1% | 100.0% | 0.0% | 99.0% |
-| ESP32-C6 | MVS + NBVI | 99.6% | 99.8% | 0.3% | 99.7% |
+| ESP32-C6 | MVS Default | 99.7% | 100.0% | 0.0% | 99.9% |
+| ESP32-C6 | MVS + NBVI | 99.6% | 100.0% | 0.0% | 99.8% |
 | ESP32-C6 | ML | 100.0% | 100.0% | 0.0% | 100.0% |
-| ESP32-S3 | MVS Default | 99.8% | 98.0% | 2.8% | 98.9% |
-| ESP32-S3 | MVS + NBVI | 96.7% | 100.0% | 0.0% | 98.3% |
-| ESP32-S3 | ML | 99.8% | 100.0% | 0.0% | 99.9% |
-| ESP32 | MVS Default | 99.8% | 100.0% | 0.0% | 99.9% |
-| ESP32 | MVS + NBVI | 99.8% | 100.0% | 0.0% | 99.9% |
-| ESP32 | ML | 99.6% | 100.0% | 0.0% | 99.8% |
+| ESP32-S3 | MVS Default | 99.7% | 100.0% | 0.0% | 99.9% |
+| ESP32-S3 | MVS + NBVI | 99.7% | 100.0% | 0.0% | 99.9% |
+| ESP32-S3 | ML | 100.0% | 100.0% | 0.0% | 100.0% |
+| ESP32 | MVS Default | 99.4% | 100.0% | 0.0% | 99.7% |
+| ESP32 | MVS + NBVI | 99.4% | 100.0% | 0.0% | 99.7% |
+| ESP32 | ML | 99.1% | 100.0% | 0.0% | 99.5% |
 
 **MVS Default**: Uses default subcarriers.
 **MVS + NBVI**: Uses NBVI auto-calibration (production case).
-**ML**: Neural network with chip-grouped CV, hard-positive mining, and Hampel filter.
+**ML**: Neural network with grouped session-level blocked CV for model selection, context-aware MVS-guided weights, and Hampel filtering. CV normalization is always disabled for ML (raw std only).
 
 ---
 
@@ -146,9 +154,34 @@ The worst-case path is ML on ESP32-C3 (~3.5 ms peak, ~35% CPU), which still leav
 
 **MVS**: Extracts a single feature (spatial turbulence) and its moving variance.
 
-**ML**: Extracts 12 statistical features from sliding window, then runs MLP inference (12 → 16 → 8 → 1 = 328 MACs). 
+**ML**: Extracts 9 statistical features from sliding window, then runs MLP inference (9 → 32 → 16 → 1 = 816 MACs).
 The MLP itself is lightweight; most time is spent on feature extraction. 
 For ML architecture details, see [ALGORITHMS.md](micro-espectre/ALGORITHMS.md#architecture).
+
+---
+
+## 60-Second Test Recordings
+
+Continuous recordings (~30s idle + ~30s motion) provide a realistic production-style scenario. These files are not used during training.
+
+Test data: `micro-espectre/data/test/`
+Source of truth: `micro-espectre/tests/test_validation_long_recordings.py`
+
+Methodology:
+- `MVS + NBVI`: run NBVI calibration on the idle segment, then evaluate the full recording with adaptive threshold and Hampel enabled
+- `ML`: use exported production weights with threshold `5.0` and Hampel enabled
+- Both paths skip the first `100` packets of each segment as warmup when scoring packet-level metrics
+
+| Chip | Algorithm | Recall | Precision | FP Rate | F1-Score | FP Count |
+|------|-----------|--------|-----------|---------|----------|----------|
+| C3 | MVS + NBVI | 100.0% | 100.0% | 0.0% | 100.0% | 0 |
+| C3 | ML | 99.1% | 100.0% | 0.0% | 99.6% | 0 |
+| C5 | MVS + NBVI | 100.0% | 91.1% | 7.9% | 95.3% | 253 |
+| C5 | ML | 100.0% | 91.1% | 7.9% | 95.3% | 253 |
+| C6 | MVS + NBVI | 100.0% | 81.4% | 21.8% | 89.7% | 691 |
+| C6 | ML | 89.5% | 96.2% | 3.4% | 92.7% | 108 |
+| S3 | MVS + NBVI | 100.0% | 96.9% | 2.8% | 98.4% | 86 |
+| S3 | ML | 96.4% | 99.1% | 0.8% | 97.7% | 25 |
 
 ---
 
@@ -156,8 +189,8 @@ For ML architecture details, see [ALGORITHMS.md](micro-espectre/ALGORITHMS.md#ar
 
 | Date | Version | Dataset | Calibration | Algorithm | Recall | Precision | FP Rate | F1-Score |
 |------|---------|---------|-------------|-----------|--------|-----------|---------|----------|
-| 2026-03-29 | v2.8.0 | C6 |  -   | ML + Hampel | 100.0% | 100.0% | 0.0% | 100.0% |
-| 2026-03-29 | v2.8.0 | C6 | NBVI | MVS + Hampel| 99.6% | 99.8% | 0.3% | 99.7% |
+| 2026-05-21 | v2.8.0 | C6 |  -   | ML + Hampel | 100.0% | 100.0% | 0.0% | 100.0% |
+| 2026-05-21 | v2.8.0 | C6 | NBVI | MVS + Hampel| 99.6% | 100.0% | 0.0% | 99.8% |
 | 2026-03-11 | v2.6.1 | C6 |  -   | ML | 100.0% | 100.0% | 0.0% | 100.0% |
 | 2026-03-11 | v2.6.1 | C6 | NBVI | MVS | 99.3% | 100.0% | 0.0% | 99.7% |
 | 2026-03-08 | v2.6.0 | C6 |  -   | ML | 100.0% | 100.0% | 0.0% | 100.0% |

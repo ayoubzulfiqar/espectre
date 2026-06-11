@@ -5,7 +5,7 @@ Tests that validate algorithm performance using real CSI data from data/.
 These tests verify that algorithms produce expected results on actual captured data.
 
 Configuration is aligned with C++ tests (test_motion_detection.cpp):
-- window_size = DETECTOR_DEFAULT_WINDOW_SIZE (75)
+- window_size = DETECTOR_DEFAULT_WINDOW_SIZE (100)
 - warmup = DETECTOR_DEFAULT_WINDOW_SIZE (buffer must be full before detection)
 - adaptive_factor = 1.1 (DEFAULT_ADAPTIVE_FACTOR)
 - enable_hampel = true
@@ -43,8 +43,7 @@ nbvi_calibrator.BUFFER_FILE = os.path.join(tempfile.gettempdir(), 'nbvi_buffer_v
 # Import from src and tools
 from segmentation import SegmentationContext
 from features import (
-    calc_skewness, calc_kurtosis, calc_entropy_turb,
-    calc_zero_crossing_rate, calc_mad,
+    calc_skewness, calc_mad,
 )
 from filters import HampelFilter
 from csi_utils import (
@@ -506,18 +505,6 @@ class TestFeatureSeparationRealData:
         # so we only require minimal separation to confirm the feature works
         assert J > 0.0001, f"Skewness Fisher's J too low: {J:.6f}"
     
-    def test_kurtosis_separation(self, baseline_amplitudes, movement_amplitudes):
-        """Test that kurtosis shows separation between baseline and movement"""
-        baseline_kurt = [calc_kurtosis(list(r), len(r), float(np.mean(r)), float(np.std(r))) for r in baseline_amplitudes]
-        movement_kurt = [calc_kurtosis(list(r), len(r), float(np.mean(r)), float(np.std(r))) for r in movement_amplitudes]
-        
-        J = fishers_criterion(baseline_kurt, movement_kurt)
-        
-        # Should have some separation
-        # Note: Kurtosis is not the primary detection method (MVS is)
-        # so we only require minimal separation to confirm the feature works
-        assert J > 0.0001, f"Kurtosis Fisher's J too low: {J:.6f}"
-    
     def test_turbulence_variance_separation(self, real_data, default_subcarriers, chip_type, use_cv_normalization, window_size):
         """Test that turbulence variance separates baseline from movement.
         
@@ -785,7 +772,7 @@ class TestPerformanceMetrics:
         - Adaptive threshold from calibration
         - Process ALL packets (no warmup skip)
         - Process baseline first, then movement (continuous context)
-        - Unified window_size (75) and adaptive threshold (P95 × 1.1)
+        - Unified window_size (100) and adaptive threshold (P95 × 1.1)
         - CV normalization for ESP32 (no gain lock)
         
         Targets: >recall_target% Recall, <fp_rate_target% FP Rate.
@@ -895,7 +882,7 @@ class TestPerformanceMetrics:
         assert pkt_recall > recall_target, f"Recall too low: {pkt_recall:.1f}% (target: >{recall_target}%)"
         assert pkt_fp_rate < fp_rate_target, f"FP Rate too high: {pkt_fp_rate:.1f}% (target: <{fp_rate_target}%)"
 
-    def test_ml_detection_accuracy(self, real_data, num_subcarriers, ml_fp_rate_target, ml_recall_target, chip_type, use_cv_normalization):
+    def test_ml_detection_accuracy(self, real_data, num_subcarriers, ml_fp_rate_target, ml_recall_target, chip_type):
         """
         Test ML (Neural Network) motion detection accuracy with real CSI data.
         
@@ -903,7 +890,7 @@ class TestPerformanceMetrics:
         No calibration needed - uses pre-trained weights.
         
         Note: ML model uses fixed subcarriers from config.DEFAULT_SUBCARRIERS regardless of chip type.
-        CV normalization is enabled for chips without gain lock (ESP32).
+        CV normalization is always off — the model is trained on raw std.
         
         Targets: >ml_recall_target% Recall, <ml_fp_rate_target% FP Rate.
         """
@@ -921,12 +908,11 @@ class TestPerformanceMetrics:
         
         # ========================================
         # Initialize ML Detector (no calibration needed)
-        # CV normalization only for chips without gain lock
+        # CV normalization always off (model trained on raw std)
         # ========================================
         detector = MLDetector(
             threshold=5.0,  # Default scaled threshold (0.1-10.0)
             window_size=DETECTOR_DEFAULT_WINDOW_SIZE,
-            use_cv_normalization=use_cv_normalization
         )
         
         print(f"\nML Detector initialized")

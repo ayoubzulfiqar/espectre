@@ -197,8 +197,11 @@ python 9_compare_chips.py --plot
 **Purpose**: Train, evaluate, and export the production ML model
 
 - Trains the MLP detector with weighted binary cross-entropy
-- Default training uses `--fp-weight 2.0` and context-aware MVS-guided sample weights
-- Supports architecture experiments and feature-importance analysis
+- Default training uses `--fp-weight 1.0`, `--scaler standard`, `--batch-size 32`, grouped session-level CV, and context-aware MVS-guided sample weights
+- Reports blocked out-of-fold metrics plus worst session/chip/source-file groups
+- Uses the standard compiled Keras training/inference path on CPU-only TensorFlow
+- Supports FP-first architecture campaigns and feature-importance analysis
+- Supports optional chip exclusion experiments via `--exclude-chip CHIP[,CHIP...]`
 - Exports weights for both platforms:
   - `micro-espectre/src/ml_weights.py`
   - `components/espectre/ml_weights.h`
@@ -206,14 +209,40 @@ python 9_compare_chips.py --plot
 ```bash
 python 10_train_ml_model.py                # Train with default settings
 python 10_train_ml_model.py --info         # Show dataset and split info
-python 10_train_ml_model.py --experiment   # Compare model architectures
+python 10_train_ml_model.py --experiment   # Run the FP-first MLP topology campaign
+python 10_train_ml_model.py --experiment --experiment-promote  # Promote the winner if it beats the baseline
+python 10_train_ml_model.py --experiment --experiment-architectures "16,8;24,12;32,16;24;24,12,6"  # Custom shortlist
 python 10_train_ml_model.py --fp-weight 2.0  # Penalize false positives 2x
+python 10_train_ml_model.py --scaler clipped_standard  # Robust clipping + z-score
+python 10_train_ml_model.py --batch-size 128  # Faster exploratory sweeps
+python 10_train_ml_model.py --exclude-chip ESP32  # Run a chip-exclusion experiment
 python 10_train_ml_model.py --seed-search-until-improvement 20  # Stop at first better seed
 python 10_train_ml_model.py --shap         # SHAP importance (200 samples)
 python 10_train_ml_model.py --shap 500     # SHAP importance (500 samples)
 ```
 
+For production artifact promotion, prefer either `--seed-search-until-improvement` or the FP-first `--experiment --experiment-promote` campaign instead of a plain training run. The plain command always exports the requested seed, while the gated flows replace artifacts only after a stricter validation pass.
+
 For full training workflow and dataset preparation, see [ML_DATA_COLLECTION.md](../ML_DATA_COLLECTION.md#5-train-model).
+
+### 11. Dataset Quality Validation (`11_validate_dataset_quality.py`)
+
+Validates CSI datasets for integrity, signal quality, and ML readiness. Runs automated checks on all baseline/movement pairs and optionally generates a structured markdown report.
+
+**Checks performed:**
+- File integrity — NPZ loads, expected keys exist, shapes are valid
+- Signal quality — amplitude range, zero-packet detection
+- Pair validation — baseline vs movement variance ratio, temporal gap
+- ML readiness — label balance, minimum samples, chip diversity
+
+Turbulence mode follows MVS conventions: raw std for gain-locked files, CV normalization for files without gain lock. ML always uses raw std regardless.
+
+```bash
+python 11_validate_dataset_quality.py              # Full validation
+python 11_validate_dataset_quality.py --chip C6    # Validate C6 only
+python 11_validate_dataset_quality.py --report     # Generate markdown report
+python 11_validate_dataset_quality.py --strict     # Fail on warnings too
+```
 
 ---
 
@@ -229,6 +258,8 @@ cd tools
 #   Terminal 1: ./me stream --ip <PC_IP>
 #   Terminal 2: ./me collect --label baseline --duration 60
 #               ./me collect --label movement --duration 30
+# Optional debug terminal:
+#               ./me detect --log-turbulence
 # see ../ML_DATA_COLLECTION.md for details
 
 # 1. Analyze raw data

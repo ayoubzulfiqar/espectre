@@ -7,7 +7,7 @@
  * The ESP32 WiFi hardware has automatic gain control that can cause CSI amplitude
  * variations even in static environments. This controller:
  * 1. Collects gain statistics from the first N packets after boot
- * 2. Calculates average AGC and FFT gain values
+ * 2. Calculates median AGC and FFT gain values
  * 3. Locks (forces) these values to eliminate gain-induced variations
  * 
  * Supported platforms: ESP32-S3, ESP32-C3, ESP32-C5, ESP32-C6
@@ -108,7 +108,7 @@ extern "C" {
  * 
  * The gain lock phase happens BEFORE band calibration to ensure clean data:
  * - Phase 1: Gain Lock (~3 seconds, 300 packets) - locks AGC/FFT using median
- * - Phase 2: Band Calibration (~7.5 seconds, 750 packets) - with stable gain
+ * - Phase 2: Band Calibration (~10 seconds, 1000 packets) - with stable gain
  */
 class GainController {
  public:
@@ -224,14 +224,20 @@ class GainController {
   /**
    * Check if CV normalization is needed
    * 
-   * CV normalization (dividing by mean) is needed when gain lock was skipped
-   * (strong signal) or when mode is DISABLED. In these cases, AGC/FFT vary
-   * dynamically and CV normalization provides stable turbulence values.
+   * CV normalization (dividing by mean) is needed whenever AGC/FFT are not
+   * effectively locked. That includes:
+   * - strong-signal AUTO fallback (gain lock skipped)
+   * - explicit DISABLED mode
+   * - platforms that do not expose PHY gain-lock APIs at all
+   *
+   * In these cases, AGC/FFT can vary dynamically and CV normalization provides
+   * stable turbulence values aligned with the training pipeline used for
+   * `gain_locked=false` datasets.
    * 
    * @return true if CV normalization should be applied
    */
   bool needs_cv_normalization() const {
-    return skipped_strong_signal_ || mode_ == GainLockMode::DISABLED;
+    return skip_gain_lock_ || skipped_strong_signal_ || mode_ == GainLockMode::DISABLED;
   }
   
  private:

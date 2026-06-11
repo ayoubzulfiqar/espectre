@@ -12,9 +12,7 @@ import math
 import numpy as np
 from features import (
     calc_skewness,
-    calc_kurtosis,
-    calc_entropy_turb,
-    calc_zero_crossing_rate,
+    calc_iqr,
     calc_autocorrelation,
     calc_mad,
     extract_features_by_name,
@@ -103,147 +101,40 @@ class TestCalcSkewness:
         assert abs(skew_all) != abs(skew_partial)
 
 
-class TestCalcKurtosis:
-    """Test kurtosis calculation"""
-    
-    def test_empty_list(self):
-        """Test kurtosis of empty list"""
-        assert calc_kurtosis([], 0, 0.0, 0.0) == 0.0
-    
-    def test_single_value(self):
-        """Test kurtosis of single value"""
-        assert calc_kurtosis([5.0], 1, 5.0, 0.0) == 0.0
-    
-    def test_three_values(self):
-        """Test kurtosis of three values (needs 4+)"""
-        n, m, s = _stats([1.0, 2.0, 3.0])
-        assert calc_kurtosis([1.0, 2.0, 3.0], n, m, s) == 0.0
-    
-    def test_normal_distribution(self):
-        """Test kurtosis of normal distribution (should be ~0)"""
-        np.random.seed(42)
-        values = list(np.random.normal(0, 1, 1000))
-        n, m, s = _stats(values)
-        kurt = calc_kurtosis(values, n, m, s)
-        # Excess kurtosis of normal is 0
-        assert abs(kurt) < 0.5
-    
-    def test_uniform_distribution(self):
-        """Test kurtosis of uniform distribution (should be < 0)"""
-        np.random.seed(42)
-        values = list(np.random.uniform(0, 1, 1000))
-        n, m, s = _stats(values)
-        kurt = calc_kurtosis(values, n, m, s)
-        # Uniform distribution has negative excess kurtosis
-        assert kurt < 0
-    
-    def test_heavy_tailed(self):
-        """Test kurtosis of heavy-tailed distribution (should be > 0)"""
-        # Create data with outliers -> heavy tails
-        values = list(np.random.normal(0, 1, 100))
-        values.extend([10.0, -10.0, 15.0, -15.0])  # Add outliers
-        n, m, s = _stats(values)
-        kurt = calc_kurtosis(values, n, m, s)
-        # Should have positive excess kurtosis
-        assert kurt > 0
-    
-    def test_constant_values(self):
-        """Test kurtosis of constant values (std=0)"""
-        values = [5.0] * 10
-        n, m, s = _stats(values)
-        kurt = calc_kurtosis(values, n, m, s)
-        assert kurt == 0.0
+class TestCalcIQR:
+    """Test interquartile range calculation."""
 
-
-class TestCalcEntropyTurb:
-    """Test Shannon entropy calculation"""
-    
     def test_empty_buffer(self):
-        """Test entropy of empty buffer"""
-        assert calc_entropy_turb([], 0) == 0.0
-    
-    def test_single_value(self):
-        """Test entropy of single value"""
-        assert calc_entropy_turb([5.0], 1) == 0.0
-    
-    def test_constant_values(self):
-        """Test entropy of constant values (max-min ~0)"""
-        buffer = [5.0] * 10
-        entropy = calc_entropy_turb(buffer, 10)
-        assert entropy == 0.0
-    
-    def test_uniform_distribution_max_entropy(self):
-        """Test that uniform distribution has higher entropy"""
-        # Uniform across bins -> high entropy
-        buffer = [float(i % 10) for i in range(100)]  # 0-9 evenly
-        entropy = calc_entropy_turb(buffer, 100, n_bins=10)
-        
-        # Max entropy for 10 bins = log2(10) ~ 3.32
-        assert entropy > 2.0
-    
-    def test_concentrated_distribution_low_entropy(self):
-        """Test that concentrated distribution has low entropy"""
-        # All values in one bin -> low entropy
-        buffer = [5.0 + 0.01 * i for i in range(100)]  # Very narrow range
-        entropy = calc_entropy_turb(buffer, 100, n_bins=10)
-        
-        # Most values in few bins -> lower entropy
-        assert entropy >= 0
-    
-    def test_returns_positive(self):
-        """Test that entropy is non-negative"""
-        np.random.seed(42)
-        buffer = list(np.random.normal(5, 2, 50))
-        entropy = calc_entropy_turb(buffer, 50)
-        assert entropy >= 0
+        """Test IQR of empty buffer."""
+        assert calc_iqr([], 0) == 0.0
 
-
-class TestCalcZeroCrossingRate:
-    """Test zero-crossing rate calculation"""
-    
-    def test_empty_buffer(self):
-        """Test ZCR of empty buffer"""
-        assert calc_zero_crossing_rate([], 0) == 0.0
-    
     def test_single_value(self):
-        """Test ZCR of single value"""
-        assert calc_zero_crossing_rate([5.0], 1) == 0.0
-    
+        """Test IQR of single value."""
+        assert calc_iqr([5.0], 1) == 0.0
+
     def test_constant_values(self):
-        """Test ZCR of constant values (all at mean)"""
+        """Test IQR of constant values."""
         buffer = [5.0] * 10
-        zcr = calc_zero_crossing_rate(buffer, 10)
-        assert zcr == 0.0
-    
-    def test_alternating_values(self):
-        """Test ZCR of perfectly alternating values"""
-        buffer = [0.0, 10.0, 0.0, 10.0, 0.0, 10.0]
-        zcr = calc_zero_crossing_rate(buffer, 6)
-        # Mean is 5.0, so 0<5<10>5>0<5<10>5>0 -> crosses every time
-        assert zcr == 1.0
-    
-    def test_monotonic_increasing(self):
-        """Test ZCR of monotonic increasing values"""
-        buffer = [float(i) for i in range(10)]
-        zcr = calc_zero_crossing_rate(buffer, 10)
-        # Mean is 4.5, values cross only once (from below to above)
-        # 0,1,2,3,4 below mean, 5,6,7,8,9 above mean -> 1 crossing
-        assert zcr == pytest.approx(1.0 / 9.0, rel=1e-6)
-    
-    def test_output_range(self):
-        """Test that ZCR is always in [0, 1]"""
+        assert calc_iqr(buffer, 10) == 0.0
+
+    def test_monotonic_values(self):
+        """Test IQR on a simple increasing sequence."""
+        buffer = [float(i) for i in range(8)]
+        iqr = calc_iqr(buffer, 8)
+        assert iqr == pytest.approx(3.5, rel=1e-6)
+
+    def test_outlier_robustness(self):
+        """Test that a single outlier has limited impact on IQR."""
+        buffer = [1.0] * 9 + [100.0]
+        iqr = calc_iqr(buffer, 10)
+        assert iqr == 0.0
+
+    def test_positive_for_spread_distribution(self):
+        """Test that wider distributions yield positive IQR."""
         np.random.seed(42)
-        buffer = list(np.random.normal(5, 2, 50))
-        zcr = calc_zero_crossing_rate(buffer, 50)
-        assert 0.0 <= zcr <= 1.0
-    
-    def test_high_zcr_for_noisy_signal(self):
-        """Test that noisy signal has high ZCR"""
-        np.random.seed(42)
-        buffer = list(np.random.normal(0, 1, 100))
-        zcr = calc_zero_crossing_rate(buffer, 100)
-        # Random noise should cross mean frequently
-        assert zcr > 0.3
+        buffer = list(np.random.normal(5, 2, 100))
+        iqr = calc_iqr(buffer, 100)
+        assert iqr > 0.0
 
 
 class TestCalcAutocorrelation:
@@ -336,31 +227,39 @@ class TestCalcMAD:
 class TestExtractAllFeatures:
     """Test full feature extraction"""
     
-    def test_returns_12_features(self):
-        """Test that 12 features are returned"""
+    def test_returns_default_feature_count(self):
+        """Test that the default feature count is returned"""
         buffer = [float(i) for i in range(50)]
         features = extract_features_by_name(buffer, 50, feature_names=DEFAULT_FEATURES)
-        assert len(features) == 12
+        assert len(features) == len(DEFAULT_FEATURES)
     
     def test_empty_buffer_returns_zeros(self):
         """Test that empty buffer returns zeros"""
         features = extract_features_by_name([], 0, feature_names=DEFAULT_FEATURES)
-        assert features == [0.0] * 12
+        assert features == [0.0] * len(DEFAULT_FEATURES)
     
     def test_single_value_returns_zeros(self):
         """Test that single-value buffer returns zeros"""
         features = extract_features_by_name([5.0], 1, feature_names=DEFAULT_FEATURES)
-        assert features == [0.0] * 12
+        assert features == [0.0] * len(DEFAULT_FEATURES)
     
     def test_feature_names_match(self):
-        """Test that FEATURE_NAMES has 12 entries"""
-        assert len(FEATURE_NAMES) == 12
+        """Test that FEATURE_NAMES matches DEFAULT_FEATURES"""
+        assert len(FEATURE_NAMES) == len(DEFAULT_FEATURES)
+
+    def test_unknown_feature_raises(self):
+        """Removed legacy features are no longer accepted."""
+        buffer = [float(i) for i in range(50)]
+        with pytest.raises(ValueError, match="Unknown feature"):
+            extract_features_by_name(buffer, 50, feature_names=['turb_kurtosis'])
     
     def test_amplitudes_parameter_ignored(self):
         """Test that amplitudes parameter does not affect output"""
         buffer = [float(i) for i in range(50)]
         features_no_amp = extract_features_by_name(buffer, 50, feature_names=DEFAULT_FEATURES)
-        features_with_amp = extract_features_by_name(buffer, 50, amplitudes=[1.0] * 12, feature_names=DEFAULT_FEATURES)
+        features_with_amp = extract_features_by_name(
+            buffer, 50, amplitudes=[1.0] * 12, feature_names=DEFAULT_FEATURES
+        )
         assert features_no_amp == features_with_amp
     
     def test_all_features_are_float(self):
@@ -385,4 +284,5 @@ class TestExtractAllFeatures:
         # Std should be higher for motion
         assert motion_features[1] > idle_features[1]
         # MAD should be higher for motion
-        assert motion_features[9] > idle_features[9]
+        mad_idx = FEATURE_NAMES.index('turb_mad')
+        assert motion_features[mad_idx] > idle_features[mad_idx]

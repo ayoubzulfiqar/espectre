@@ -19,30 +19,44 @@ import math
 try:
     from src.detector_interface import IDetector, MotionState
     from src.segmentation import SegmentationContext
-    from src.features import extract_features_by_name, DEFAULT_FEATURES
+    from src.features import extract_features_by_name
     from src.config import DEFAULT_SUBCARRIERS
-    from src.ml_weights import (
-        FEATURE_MEAN, FEATURE_SCALE,
-        W1, B1, W2, B2, W3, B3
-    )
 except ImportError:
     from detector_interface import IDetector, MotionState
     from segmentation import SegmentationContext
-    from features import extract_features_by_name, DEFAULT_FEATURES
+    from features import extract_features_by_name
     from config import DEFAULT_SUBCARRIERS
+
+try:
+    from src.ml_weights import (
+        FEATURE_MEAN, FEATURE_SCALE,
+        MODEL_LAYER_SIZES, WEIGHTS, BIASES, FEATURE_NAMES,
+    )
+except ImportError:
     from ml_weights import (
         FEATURE_MEAN, FEATURE_SCALE,
-        W1, B1, W2, B2, W3, B3
+        MODEL_LAYER_SIZES, WEIGHTS, BIASES, FEATURE_NAMES,
     )
 
 # Re-export for convenience
-__all__ = ['MLDetector', 'predict', 'is_motion', 'DEFAULT_SUBCARRIERS']
+__all__ = ['MLDetector', 'predict', 'is_motion', 'DEFAULT_SUBCARRIERS', 'FEATURE_NAMES']
 
 # ML-specific constants (unified with MVS for consistent UI)
 ML_DEFAULT_THRESHOLD = 5.0
 ML_MIN_THRESHOLD = 0.0
 ML_MAX_THRESHOLD = 10.0
 ML_METRIC_SCALE = 10.0
+ML_TEMPERATURE = 5.0
+
+# Transpose weight matrices at load time: [input][output] → [output][input].
+# This makes the inner multiply-add loop access weights[j] once per output
+# neuron instead of weights[i][j] (2 lookups) per multiply-add.
+_WEIGHTS_T = []
+for _lw in WEIGHTS:
+    _n_in = len(_lw)
+    _n_out = len(_lw[0])
+    _WEIGHTS_T.append([[_lw[i][j] for i in range(_n_in)] for j in range(_n_out)])
+del _lw, _n_in, _n_out
 
 # ============================================================================
 # Neural Network Inference Functions
@@ -64,6 +78,10 @@ def sigmoid(x):
 
 def normalize_features(features):
     """Normalize features using pre-computed mean and scale."""
+    if len(features) != len(FEATURE_MEAN):
+        raise ValueError(
+            f"Expected {len(FEATURE_MEAN)} features, got {len(features)}"
+        )
     normalized = []
     for i in range(len(features)):
         normalized.append((features[i] - FEATURE_MEAN[i]) / FEATURE_SCALE[i])
@@ -72,41 +90,35 @@ def normalize_features(features):
 
 def predict(features):
     """
-    Predict motion probability from 12 features.
-    
-    Architecture: 12 -> 16 (ReLU) -> 8 (ReLU) -> 1 (Sigmoid)
+    Predict motion probability from the exported feature vector.
     
     Args:
-        features: List of 12 feature values
+        features: Ordered feature vector expected by the exported model
     
     Returns:
         float: Scaled motion metric (0.0 to 10.0)
     """
-    # Normalize
-    x = normalize_features(features)
-    
-    # Layer 1: 12 -> 16 (ReLU)
-    h1 = []
-    for j in range(16):
-        val = B1[j]
-        for i in range(12):
-            val += x[i] * W1[i][j]
-        h1.append(relu(val))
-    
-    # Layer 2: 16 -> 8 (ReLU)
-    h2 = []
-    for j in range(8):
-        val = B2[j]
-        for i in range(16):
-            val += h1[i] * W2[i][j]
-        h2.append(relu(val))
-    
-    # Layer 3: 8 -> 1 (Sigmoid)
-    out = B3[0]
-    for i in range(8):
-        out += h2[i] * W3[i][0]
-    
-    return sigmoid(out) * ML_METRIC_SCALE
+    n_feat = len(features)
+    activations = [0.0] * n_feat
+    for i in range(n_feat):
+        activations[i] = (features[i] - FEATURE_MEAN[i]) / FEATURE_SCALE[i]
+
+    n_layers = len(_WEIGHTS_T)
+    for layer_idx in range(n_layers):
+        weights_t = _WEIGHTS_T[layer_idx]
+        biases = BIASES[layer_idx]
+        n_out = len(biases)
+        next_activations = [0.0] * n_out
+        is_last = layer_idx == n_layers - 1
+        for j in range(n_out):
+            val = biases[j]
+            w_row = weights_t[j]
+            for i in range(len(activations)):
+                val += activations[i] * w_row[i]
+            next_activations[j] = val if is_last else (val if val > 0 else 0.0)
+        activations = next_activations
+
+    return sigmoid(activations[0] / ML_TEMPERATURE) * ML_METRIC_SCALE
 
 
 def is_motion(features, threshold=ML_DEFAULT_THRESHOLD):
@@ -114,7 +126,7 @@ def is_motion(features, threshold=ML_DEFAULT_THRESHOLD):
     Detect motion from features.
     
     Args:
-        features: List of 12 feature values
+        features: Ordered feature vector expected by the exported model
         threshold: Detection threshold (default: 5.0)
     
     Returns:
@@ -132,34 +144,32 @@ class MLDetector(IDetector):
     """
     Neural Network-based motion detector.
     
-    Uses a pre-trained MLP (12 -> 16 -> 8 -> 1) to classify
+    Uses a pre-trained MLP exported by the training pipeline to classify
     motion based on turbulence features extracted from CSI data.
     
     Algorithm:
     1. Calculate spatial turbulence (std of subcarrier amplitudes)
     2. Store in circular buffer (window_size packets)
-    3. Extract 12 statistical features from buffer
+    3. Extract the configured ML feature vector from buffer
     4. Run neural network inference
     5. Compare probability to threshold for state decision
     """
     
-    def __init__(self, window_size=75, threshold=ML_DEFAULT_THRESHOLD,
+    def __init__(self, window_size=100, threshold=ML_DEFAULT_THRESHOLD,
                  enable_lowpass=False, lowpass_cutoff=11.0,
                  enable_hampel=True, hampel_window=7, hampel_threshold=5.0,
-                 use_cv_normalization=False):
+                 **kwargs):
         """
         Initialize ML detector.
         
         Args:
-            window_size: Feature extraction window size (default: 75, matches C++ DETECTOR_DEFAULT_WINDOW_SIZE)
+            window_size: Feature extraction window size (default: 100, matches C++ DETECTOR_DEFAULT_WINDOW_SIZE)
             threshold: Motion detection threshold (default: 5.0, range 0.0-10.0)
             enable_lowpass: Enable low-pass filter (default: False)
             lowpass_cutoff: Low-pass cutoff frequency Hz (default: 11.0)
             enable_hampel: Enable Hampel filter (default: True, model trained with Hampel)
             hampel_window: Hampel window size (default: 7)
             hampel_threshold: Hampel threshold in MAD (default: 5.0)
-            use_cv_normalization: Use CV (std/mean) instead of raw std (default: False)
-                                  Set True for chips without gain lock (e.g., ESP32)
         """
         # Use SegmentationContext for turbulence calculation and filtering
         self._context = SegmentationContext(
@@ -171,9 +181,8 @@ class MLDetector(IDetector):
             hampel_window=hampel_window,
             hampel_threshold=hampel_threshold
         )
-        # CV normalization: True for chips without gain lock (ESP32)
-        # False for chips with gain lock (C3, C6, S3) - raw std is more sensitive
-        self._context.use_cv_normalization = use_cv_normalization
+        # ML model is trained on raw std only — CV normalization must stay off
+        self._context.use_cv_normalization = False
         self._threshold = threshold
         self._packet_count = 0
         self._motion_count = 0
@@ -184,9 +193,6 @@ class MLDetector(IDetector):
         self.probability_history = []
         self.state_history = []
         self.track_data = False
-        
-        # Store current amplitudes for feature extraction
-        self._current_amplitudes = None
     
     def process_packet(self, csi_data, selected_subcarriers=None):
         """
@@ -198,15 +204,11 @@ class MLDetector(IDetector):
         """
         self._packet_count += 1
         
-        # Calculate spatial turbulence using instance method (CV-normalized)
-        # Also get amplitudes for cross-subcarrier features
-        turbulence, amplitudes = self._context.calculate_spatial_turbulence(
-            csi_data, selected_subcarriers, return_amplitudes=True
+        # ML features use only the turbulence window; skip per-packet amplitude lists.
+        turbulence = self._context.calculate_spatial_turbulence(
+            csi_data, selected_subcarriers
         )
-        
-        # Store amplitudes for feature extraction
-        self._current_amplitudes = amplitudes
-        
+
         # Add to buffer
         self._context.add_turbulence(turbulence)
     
@@ -251,7 +253,7 @@ class MLDetector(IDetector):
     
     def _extract_features(self):
         """
-        Extract 12 features from turbulence buffer using centralized extractor.
+        Extract the configured feature vector from turbulence buffer.
         
         IMPORTANT: The turbulence_buffer is a circular buffer. After wrap-around,
         a simple slice [:buffer_count] would NOT be in chronological order.
@@ -272,9 +274,8 @@ class MLDetector(IDetector):
             turb_list = ctx.turbulence_buffer[idx:] + ctx.turbulence_buffer[:idx]
         
         return extract_features_by_name(
-            turb_list, len(turb_list), 
-            amplitudes=self._current_amplitudes,
-            feature_names=DEFAULT_FEATURES
+            turb_list, len(turb_list),
+            feature_names=FEATURE_NAMES
         )
     
     def get_state(self):
@@ -295,6 +296,17 @@ class MLDetector(IDetector):
             self._threshold = threshold
             return True
         return False
+
+    def set_cv_normalization(self, enabled):
+        """
+        Ignore CV normalization requests.
+
+        The exported ML model is trained on raw standard deviation, so the
+        runtime must keep CV normalization disabled to stay aligned with the
+        C++ implementation and the training pipeline.
+        """
+        del enabled
+        self._context.use_cv_normalization = False
     
     def is_ready(self):
         """Check if buffer is full."""

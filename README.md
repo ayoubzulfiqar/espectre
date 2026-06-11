@@ -10,7 +10,7 @@
 **Motion detection system based on Wi-Fi spectre analysis (CSI), with native Home Assistant integration via ESPHome.**
 
 > [!TIP]
-> **New in v2.5 — ML Detector**: Neural network-based motion detection. No calibration required, runs on-device. This is an experimental feature, feedback is welcome in the [discussion](https://github.com/francescopace/espectre/discussions/84). A [snapshot build](https://github.com/francescopace/espectre/releases/tag/snapshot) with the latest changes is also available (use `-ml` assets for the machine learning based detector), or follow [Setup guide](SETUP.md#choosing-detection-algorithm) for custom configuration. 
+> **New ML Detector**: Neural network-based motion detection. No calibration required, runs on-device. This is an experimental feature, and feedback is welcome in the dedicated [ML detector discussion](https://github.com/francescopace/espectre/discussions/126). A [snapshot build](https://github.com/francescopace/espectre/releases/tag/snapshot) with the latest changes is also available (use `-ml` assets for the machine learning based detector), or follow [Setup guide](SETUP.md#choosing-detection-algorithm) for custom configuration.
 
 ---
 
@@ -30,6 +30,7 @@
 - [Future Evolution](#future-evolution)
 - [Documentation](#documentation)
 - [Media](#media)
+- [Related Projects](#related-projects)
 - [Acknowledgments](#acknowledgments)
 - [License](#license)
 - [Author](#author)
@@ -181,14 +182,20 @@ ESPectre uses a focused processing pipeline for motion detection:
        │
        ▼
 ┌─────────────┐
-│Segmentation │  MVS algorithm
-│    (MVS)    │  IDLE ↔ MOTION
+│ Detection   │  MVS or ML score
+│ Evaluation  │  every evaluation_interval packets
 └──────┬──────┘
        │
        ▼
 ┌─────────────┐
-│ Home        │  Native ESPHome integration
-│ Assistant   │  Binary sensor + Movement/Threshold
+│ Hit Filter  │  motion_on_hits / motion_off_hits
+│             │  edge-driven IDLE ↔ MOTION
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│ Home        │  Edge-driven motion binary +
+│ Assistant   │  periodic Movement Score / Threshold
 └─────────────┘
 ```
 
@@ -211,8 +218,8 @@ ESPectre uses a focused processing pipeline for motion detection:
 ```
 
 Each sensor is automatically discovered by Home Assistant with:
-- Binary sensor for motion detection
-- Movement score sensor
+- Binary sensor for motion detection, published immediately on state edges
+- Movement score sensor, published on the periodic cadence
 - Adjustable threshold (number entity)
 
 ### Automatic Subcarrier Selection
@@ -373,13 +380,13 @@ While ESPectre v2.x focuses on **motion detection** (MVS + automatic subcarrier 
 
 | Capability | Status | Description |
 |------------|--------|-------------|
-| **ML Detector** | Experimental | Neural network (MLP 12→16→8→1, 97-100% F1), ~3s boot time |
+| **ML Detector** | Experimental | Neural network (MLP 9→32→16→1)|
 | **Gesture Recognition** | Planned | Detect hand gestures (swipe, push, circle) for smart home control |
 | **Human Activity Recognition** | Planned | Identify activities (sitting, walking, falling) |
 | **People Counting** | Planned | Estimate number of people in a room |
 | **3D Localization** | Research | Indoor positioning (30-50cm accuracy) via phase-coherent antenna array |
 
-The ML Detector is already available with `detection_algorithm: ml` in your YAML configuration. For algorithm details, see [ALGORITHMS.md](micro-espectre/ALGORITHMS.md#ml-neural-network-detector). 
+The ML Detector is already available with `detection_algorithm: ml` in your YAML configuration. For algorithm details, see [ALGORITHMS.md](micro-espectre/ALGORITHMS.md#ml-neural-network-detector) and `PERFORMANCE.md` for current metrics  
 The ML data collection and training infrastructure is documented in [ML_DATA_COLLECTION.md](micro-espectre/ML_DATA_COLLECTION.md).
 
 See [ROADMAP.md](ROADMAP.md) for detailed plans, timelines, and how to contribute.
@@ -429,6 +436,8 @@ See [ROADMAP.md](ROADMAP.md) for detailed plans, timelines, and how to contribut
 | Medium | [How I Turned My Wi-Fi Into a Motion Sensor - Part 2](https://medium.com/@francesco.pace/how-i-turned-my-wi-fi-into-a-motion-sensor-part-2-62038130e530?sk=7c8b6f11cf3fcb8d279648016ebff72a&utm_source=github&utm_medium=readme&utm_campaign=espectre) |
 | IoT For All | [How I Turned My Wi-Fi Into a Motion Sensor](https://www.iotforall.com/wifi-motion-sensor-iot) |
 | Hackaday | [Make Your Own ESP32-Based Person Sensor, No Special Hardware Needed](https://hackaday.com/2026/01/28/make-your-own-esp32-based-person-sensor-no-special-hardware-needed/) |
+| Adafruit Learn | [ESPectre Human Detector for Feather](https://learn.adafruit.com/espectre-human-detector-for-feather) |
+| Seeed Studio Wiki | [Deploying Espectre on Seeed Studio XIAO ESP32 Series with ESPHome](https://wiki.seeedstudio.com/xiao-esp32--series-espresense/) |
 
 | Blog | Discussion |
 |----------|------------|
@@ -441,6 +450,13 @@ See [ROADMAP.md](ROADMAP.md) for detailed plans, timelines, and how to contribut
 | Podcasts | Episode |
 |-------------|---------|
 | Hackaday | [Podcast Episode 355: Person Detectors, Walkie Talkies, Open Smartphones...](https://hackaday.com/2026/01/30/hackaday-podcast-episode-355-person-detectors-walkie-talkies-open-smartphones-and-a-wifi-traffic-light/) |
+
+---
+
+## Related Projects
+
+- [radio-presence-scanner](https://github.com/francescopace/radio-presence-scanner): complementary presence-sensing project focused on BLE radio observations from host devices (Python), with optional HTTP dashboard.
+- [micropython-esp32-csi](https://github.com/francescopace/micropython-esp32-csi): custom MicroPython fork exposing ESP32 CSI APIs, used as the firmware foundation for rapid CSI prototyping in the Micro-ESPectre workflow.
 
 ---
 
@@ -462,9 +478,8 @@ GPLv3 ensures that:
 
 See [LICENSE](LICENSE) for the full license text.
 
-Contributions are submitted under GPLv3 and require acceptance of the
-[Contributor License Agreement](CLA.md), which grants the maintainer
-additional relicensing rights.
+Contributions are submitted under GPLv3 and must include a DCO
+`Signed-off-by` trailer on each commit (`git commit -s`).
 
 ## Author
 

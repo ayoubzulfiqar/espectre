@@ -303,8 +303,10 @@ esp_err_t NBVICalibrator::run_calibration_() {
     return ESP_OK;
   }
   
-  // Prefer hinted/current band only when candidate is NOT acceptable (>target FP)
-  // AND the hint band has better or comparable FP rate.
+  // Prefer hinted/current band when it is a stable, already-acceptable choice
+  // that is not meaningfully worse than the NBVI candidate on baseline FP.
+  // This avoids replacing a known-good default band with a more conservative
+  // NBVI band that only improves the baseline proxy marginally.
   constexpr float FP_COMPARE_EPSILON = 1e-6f;
   bool use_hint_band = false;
   float hint_fp_rate = 1.0f;
@@ -314,18 +316,31 @@ esp_err_t NBVICalibrator::run_calibration_() {
                               static_cast<uint8_t>(current_band_.size()),
                               &hint_fp_rate,
                               hint_mv_values)) {
-      if (best_fp_rate > NBVI_ACCEPTABLE_FP_RATE) {
-        const float hint_cmp = hint_fp_rate + FP_COMPARE_EPSILON;
-        const float best_cmp = best_fp_rate + hint_fp_tolerance_;
+      const bool best_fp_acceptable = (best_fp_rate <= NBVI_ACCEPTABLE_FP_RATE);
+      const bool hint_fp_acceptable = (hint_fp_rate <= NBVI_ACCEPTABLE_FP_RATE);
+      const float acceptable_best_cmp = best_fp_rate + hint_fp_tolerance_ + FP_COMPARE_EPSILON;
+      const float strict_best_cmp = best_fp_rate + hint_fp_tolerance_;
+      if (best_fp_acceptable && hint_fp_acceptable) {
+        if (hint_fp_rate <= acceptable_best_cmp) {
+          use_hint_band = true;
+        } else {
+          ESP_LOGD(TAG, "Keeping candidate band with FP %.1f%% vs hint %.1f%% (acceptable target <%.1f%%)",
+                   best_fp_rate * 100.0f, hint_fp_rate * 100.0f, NBVI_ACCEPTABLE_FP_RATE * 100.0f);
+        }
+      } else if (!best_fp_acceptable) {
         const bool hint_fp_ok = prefer_hint_on_tie_
-                                    ? (hint_cmp <= best_cmp)
-                                    : (hint_cmp < best_cmp);
+                                    ? (hint_fp_rate <= acceptable_best_cmp)
+                                    : ((hint_fp_rate + FP_COMPARE_EPSILON) < strict_best_cmp);
         if (hint_fp_ok) {
           use_hint_band = true;
+        } else {
+          ESP_LOGD(TAG, "Hint FP %.1f%% not better than candidate %.1f%% (tol %.1f%%, tie=%s)",
+                   hint_fp_rate * 100.0f, best_fp_rate * 100.0f, hint_fp_tolerance_ * 100.0f,
+                   prefer_hint_on_tie_ ? "prefer" : "strict");
         }
       } else {
-        ESP_LOGD(TAG, "Keeping candidate band with FP %.1f%% (target <%.1f%%)",
-                 best_fp_rate * 100.0f, NBVI_ACCEPTABLE_FP_RATE * 100.0f);
+        ESP_LOGD(TAG, "Keeping candidate band with FP %.1f%% (target <%.1f%%, hint %.1f%% not acceptable)",
+                 best_fp_rate * 100.0f, NBVI_ACCEPTABLE_FP_RATE * 100.0f, hint_fp_rate * 100.0f);
       }
     }
   }
@@ -600,7 +615,7 @@ bool NBVICalibrator::validate_subcarriers_(const uint8_t* band, uint8_t band_siz
   // IMPORTANT (memory safety on constrained targets, e.g. ESP32-C5):
   // Do NOT read the full calibration buffer in one allocation.
   // A previous refactor used read_window(0, buffer_count), which can allocate
-  // ~50 KB for 750 packets and trigger std::bad_alloc/abort during NBVI.
+  // ~70 KB for 1000 packets and trigger std::bad_alloc/abort during NBVI.
   //
   // Keep validation bounded by reading fixed-size chunks from SPIFFS.
   // This is intentionally more conservative than a single bulk read to avoid

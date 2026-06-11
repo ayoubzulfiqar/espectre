@@ -57,13 +57,13 @@ When a person moves in an environment, they alter multipath reflections, change 
 │                                                                                   │
 │  ┌──────────┐    ┌──────────┐    ┌──────────────┐    ┌─────────────┐              │
 │  │ CSI Data │───▶│Gain Lock │───▶│ Band Select  │───▶│ Turbulence  │              │
-│  │ N subcs  │    │ AGC/FFT  │    │ 12 subcs     │    │ σ/μ (CV)    │              │
+│  │ N subcs  │    │ AGC/FFT  │    │ 12 subcs     │    │ σ or σ/μ    │              │
 │  └──────────┘    └──────────┘    └──────────────┘    └──────┬──────┘              │
-│                  (3s, 300 pkt)   (7.5s, 10×window)          │                     │
+│                  (3s, 300 pkt)   (10s, 10×window)           │                     │
 │                                                             ▼                     │
 │  ┌───────────┐    ┌───────────────┐    ┌─────────────────┐  ┌──────────────────┐  │
 │  │ IDLE or   │◀───│ Adaptive      │◀───│ Moving Variance │◀─│ Optional Filters │  │
-│  │ MOTION    │    │ Threshold     │    │ (window=75)     │  │ LowPass + Hampel │  │
+│  │ MOTION    │    │ Threshold     │    │ (window=100)    │  │ LowPass + Hampel │  │
 │  └───────────┘    └───────────────┘    └─────────────────┘  └──────────────────┘  │
 │                                                                                   │
 └───────────────────────────────────────────────────────────────────────────────────┘
@@ -71,15 +71,15 @@ When a person moves in an environment, they alter multipath reflections, change 
 
 **Calibration sequence (at boot):**
 1. **Gain Lock** (3s, 300 packets): Collect AGC/FFT, lock values
-2. **Band Calibration** (~7.5s, 10 × window_size packets): Select 12 optimal subcarriers, calculate baseline variance
+2. **Band Calibration** (~10s, 10 × window_size packets): Select 12 optimal subcarriers, calculate baseline variance
 
-With default `window_size=75`, this means 750 packets. If you change `segmentation_window_size`, the calibration buffer adjusts automatically.
+With default `window_size=100`, this means 1000 packets. If you change `segmentation_window_size`, the calibration buffer adjusts automatically.
 
 **Data flow per packet (after calibration):**
 1. **CSI Data**: Raw I/Q values for 64 subcarriers (HT20 mode)
    - Espressif format: `[Q₀, I₀, Q₁, I₁, ...]` (Imaginary first, Real second per subcarrier)
 2. **Amplitude Extraction**: `|H| = √(I² + Q²)` for selected 12 subcarriers
-3. **Spatial Turbulence (CV)**: `CV = σ(amplitudes) / μ(amplitudes)` - gain-invariant variability
+3. **Spatial Turbulence**: `σ(amplitudes)` (raw std, gain locked) or `σ/μ` (CV, gain not locked — MVS only)
 4. **Hampel Filter** (optional): Remove outliers using MAD
 5. **Low-Pass Filter** (optional): Remove high-frequency noise (Butterworth 1st order)
 6. **Moving Variance**: `Var(turbulence)` over sliding window
@@ -126,7 +126,7 @@ The lock happens in a **dedicated phase BEFORE band calibration** to ensure clea
 │  └──────────────────────────────────────────────────────────────┘   │
 │                           │                                          │
 │                           ▼                                          │
-│  PHASE 2: BAND CALIBRATION (~7.5 seconds, 10 × window_size packets) │
+│  PHASE 2: BAND CALIBRATION (~10 seconds, 10 × window_size packets)   │
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │  Now all packets have stable gain!                           │   │
 │  │  → Baseline variance calculated on clean data                │   │
@@ -140,7 +140,7 @@ The lock happens in a **dedicated phase BEFORE band calibration** to ensure clea
 - Calibration only sees data with **stable, locked gain**
 - Baseline variance is **accurate** (not inflated by AGC variations)
 - Adaptive threshold is calculated correctly
-- Total time: ~10.5 seconds (3s gain lock + 7.5s calibration)
+- Total time: ~13 seconds (3s gain lock + 10s calibration)
 
 **Why median instead of mean?** Median is more robust against outliers:
 - Occasional packet with extreme gain values doesn't skew the baseline
@@ -398,22 +398,48 @@ The Hampel filter removes statistical outliers using the Median Absolute Deviati
 The constant **1.4826** is the consistency constant that makes MAD a consistent estimator of standard deviation for Gaussian distributions.
 
 ```python
-def hampel_filter(value, buffer, threshold=5.0):
-    buffer.append(value)
-    
-    sorted_buffer = sorted(buffer)
-    median = sorted_buffer[len(buffer) // 2]
-    
-    deviations = [abs(x - median) for x in buffer]
-    mad = sorted(deviations)[len(deviations) // 2]
-    
-    scaled_mad = 1.4826 * mad * threshold
-    if abs(value - median) > scaled_mad:
-        return median  # Replace outlier
-    return value       # Keep original
+# Matches micro-espectre/src/filters.py (MicroPython) and the same logic in C++.
+# threshold_scaled = threshold * 1.4826  (pre-computed at init)
+
+def insertion_sort(arr, n):
+    for i in range(1, n):
+        key = arr[i]
+        j = i - 1
+        while j >= 0 and arr[j] > key:
+            arr[j + 1] = arr[j]
+            j -= 1
+        arr[j + 1] = key
+
+def hampel_filter(value, buffer, sorted_scratch, window_size, index, count,
+                  threshold_scaled):
+    buffer[index] = value
+    index = (index + 1) % window_size
+    if count < window_size:
+        count += 1
+    if count < 3:
+        return value
+
+    n = count
+    mid = n // 2
+
+    for i in range(n):
+        sorted_scratch[i] = buffer[i]
+    insertion_sort(sorted_scratch, n)
+    median = sorted_scratch[mid]
+
+    for i in range(n):
+        sorted_scratch[i] = abs(buffer[i] - median)
+    insertion_sort(sorted_scratch, n)
+    mad = sorted_scratch[mid]
+
+    if mad > 1e-6:
+        deviation = abs(value - median) / mad
+        if deviation > threshold_scaled:
+            return median
+    return value
 ```
 
-**Embedded optimization**: Insertion sort instead of quicksort (faster for N < 15), pre-allocated buffers (no dynamic allocation), circular buffer for O(1) insertion.
+**Embedded optimization**: Circular turbulence buffer, pre-allocated `buffer` and `sorted_scratch` (no per-packet list growth). Insertion sort on the active window (N ≤ 11) on MicroPython; the C++ component uses the same MAD test with `std::sort` on stack copies of the same small window.
 
 **Reference**: [5] CSI-F: Feature Fusion Method (MDPI Sensors)
 
@@ -461,7 +487,7 @@ By monitoring the **variance of turbulence** over a sliding window, we can relia
 
 1. **Spatial Turbulence**
 
-   Computed per packet from the 12 selected subcarrier amplitudes. Uses raw std when gain is locked, or CV normalization otherwise (see [CV Normalization](#cv-normalization-gain-invariant-turbulence)).
+   Computed per packet from the 12 selected subcarrier amplitudes. MVS uses raw std when gain is locked, or CV normalization otherwise (see [CV Normalization](#cv-normalization-gain-invariant-turbulence)). ML always uses raw std regardless of gain lock status.
 
 2. **Moving Variance (Two-Pass Algorithm)**
    ```
@@ -498,46 +524,46 @@ A neural network can learn complex, non-linear patterns that may be missed by si
 
 ### Architecture
 
-The ML detector uses a compact **Multi-Layer Perceptron (MLP)**:
+The ML detector uses a compact **Multi-Layer Perceptron (MLP)** over 9 fixed turbulence features.
+The current production export remains small enough for embedded deployment, while the runtime now accepts any exported hidden-layer layout generated by the training script.
+The training script supports `standard`, `robust`, and `clipped_standard` normalization modes. Experimental modes should be validated against the real-data regression suite before replacing the committed production weights.
+The trainer currently uses the standard compiled Keras path (`Dense(..., activation='relu')`) on the CPU-only TensorFlow stack used for production artifact generation.
+
+Current production topology:
 
 ```
-Input (12 features)
+Input (9 features)
     ↓
-Dense(16, ReLU)      ← 12×16 + 16 = 208 parameters
+Dense(32, ReLU)      ← 9×32 + 32 = 320 parameters
     ↓
-Dense(8, ReLU)       ← 16×8 + 8 = 136 parameters
+Dense(16, ReLU)      ← 32×16 + 16 = 528 parameters
     ↓
-Dense(1, Sigmoid)    ← 8×1 + 1 = 9 parameters
+Dense(1, Sigmoid)    ← 16×1 + 1 = 17 parameters
     ↓
 Output (probability)
 ```
 
-**Total**: ~350 parameters, ~2 KB (constexpr float weights)
+**Total**: 865 parameters, ~3.4 KB (constexpr float weights)
 
-The 12→16→8→1 architecture was validated as optimal through architecture search on 21,665 samples (5-fold CV):
-
-| Architecture | F1 (CV) | FP Rate | Params | Weights |
-|---|---|---|---|---|
-| **12→16→8→1** | **99.6% +/- 0.2%** | 0.5% | 353 | 1.4 KB |
-| 12→24→12→1 | 99.8% +/- 0.2% | 0.3% | 625 | 2.4 KB |
-| 12→24→1 | 99.7% +/- 0.2% | 0.5% | 337 | 1.3 KB |
-| 12→12→8→4→1 | 99.6% +/- 0.1% | 0.6% | 301 | 1.2 KB |
-| 12→8→1 | 99.2% +/- 0.2% | 1.2% | 113 | 0.4 KB |
-
-The best candidate (24-12) gains only +0.1% F1 at the cost of nearly doubling parameters and flash footprint. The 16-8 architecture offers the best balance of accuracy, size, and FP rate for embedded deployment.
+The input feature set was previously reduced from 12 to 9 after long-recording
+holdout experiments showed that `turb_kurtosis`, `turb_entropy`, and
+`turb_slope` hurt deployment robustness more than they helped paired
+validation. A later FP-first topology sweep then replaced the old `24-12`
+hidden layout with `32-16`, because the wider model improved long-run false
+positive behavior without regressing the paired validation gate.
 
 ### Inference Pipeline
 
 ```
 ┌──────────────┐    ┌──────────────┐    ┌───────────────────┐    ┌──────────────┐
-│ CSI Packet   │───▶│ Turbulence   │───▶│ Optional Filters  │───▶│ Buffer (75)  │
-│              │    │ σ/μ (CV)     │    │ Hampel + LowPass  │    │              │
+│ CSI Packet   │───▶│ Turbulence   │───▶│ Optional Filters  │───▶│ Buffer (100) │
+│              │    │ σ (raw std)  │    │ Hampel + LowPass  │    │              │
 └──────────────┘    └──────────────┘    └───────────────────┘    └──────┬───────┘
                                                                         │
                                                                         ▼
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ IDLE/MOTION  │◀───│ Threshold    │◀───│ Probability  │◀───│ 12 Features  │
-│              │    │ > 0.5        │    │ [0.0-1.0]    │    │ → Neural Net │
+│ IDLE/MOTION  │◀───│ Threshold    │◀───│ Motion Score │◀───│ 9 Features   │
+│              │    │ > 5.0        │    │ [0.0-10.0]   │    │ → Neural Net │
 └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
@@ -547,18 +573,18 @@ ML uses **fixed subcarriers** -- no band calibration needed:
 
 | Algorithm | Subcarrier Selection | Threshold | Boot Time |
 |-----------|---------------------|-----------|-----------|
-| MVS | NBVI (~7.5s) | Adaptive (percentile-based) | ~10.5s |
-| ML | **Fixed** (12 even, DC excluded) | Fixed (0.5 probability) | **~3s** |
+| MVS | NBVI (~10s) | Adaptive (percentile-based) | ~13s |
+| ML | **Fixed** (12 even, DC excluded) | Fixed (5.0 on 0-10 scale) | **~3s** |
 
-ML uses 12 fixed subcarriers selected to avoid DC and improve stability: `[12, 14, 16, 18, 20, 24, 28, 36, 40, 44, 48, 52]`. This eliminates the 7.5-second band calibration phase, reducing boot time to ~3 seconds (gain lock only).
+ML uses 12 fixed subcarriers selected to avoid DC and improve stability: `[12, 14, 16, 18, 20, 24, 28, 36, 40, 44, 48, 52]`. This eliminates the 10-second band calibration phase, reducing boot time to ~3 seconds (gain lock only).
 
 ### Features
 
-The ML detector extracts **12 non-redundant statistical features** from a sliding window of 75 turbulence values (configured via `segmentation_window_size`).
+The ML detector extracts **9 non-redundant statistical features** from a sliding window of 100 turbulence values (configured via `segmentation_window_size`).
 
 **Design principles:**
 - No redundant features (e.g., no variance alongside std, no range alongside max/min)
-- 12 turbulence-window features (11 statistical + 1 temporal-variation)
+- 9 turbulence-window features chosen by long-recording holdout performance, not CV alone
 - MicroPython compatible: pure Python implementation without numpy at runtime
 
 | # | Feature | Formula | Description |
@@ -567,65 +593,68 @@ The ML detector extracts **12 non-redundant statistical features** from a slidin
 | 1 | `turb_std` | σ = √(Σ(xᵢ-μ)²/n) | Standard deviation (spread) |
 | 2 | `turb_max` | max(xᵢ) | Maximum value in window |
 | 3 | `turb_min` | min(xᵢ) | Minimum value in window |
-| 4 | `turb_zcr` | crossings / (n-1) | Zero-crossing rate around mean |
+| 4 | `turb_iqr` | P75(x) - P25(x) | Interquartile range (robust spread) |
 | 5 | `turb_skewness` | E[(X-μ)³]/σ³ | Turbulence asymmetry (3rd moment) |
-| 6 | `turb_kurtosis` | E[(X-μ)⁴]/σ⁴ - 3 | Turbulence tailedness (4th moment) |
-| 7 | `turb_entropy` | -Σpᵢ log₂(pᵢ) | Shannon entropy (randomness) |
-| 8 | `turb_autocorr` | C(1)/C(0) | Lag-1 autocorrelation |
-| 9 | `turb_mad` | median(\|xᵢ - median(x)\|) | Median absolute deviation |
-| 10 | `turb_slope` | Linear regression | Temporal trend |
-| 11 | `waveform_length` | Σ\|xᵢ - xᵢ₋₁\| | Total temporal variation |
+| 6 | `turb_autocorr` | C(1)/C(0) | Lag-1 autocorrelation |
+| 7 | `turb_mad` | median(\|xᵢ - median(x)\|) | Median absolute deviation |
+| 8 | `waveform_length` | Σ\|xᵢ - xᵢ₋₁\| | Total temporal variation |
 
 #### Feature Categories
 
 **Basic Statistics (0-3)**: Standard statistical measures of the turbulence buffer.
 
-**Signal Dynamics (4)**:
-- **Zero-crossing rate**: Fraction of consecutive samples crossing the mean. High ZCR indicates rapid oscillations (motion), low ZCR indicates stable signal (idle).
+**Robust Spread (4, 7)**:
+- **Interquartile range (IQR)**: Spread between the 75th and 25th percentiles. More robust than zero-crossing-style oscillation counts on quiet-but-noisy windows.
+- **MAD**: Robust alternative to std, less sensitive to outliers.
 
-**Higher-Order Moments (5-6)**: Computed from the turbulence buffer (75 samples) for stable estimates.
-- **Skewness**: Asymmetry of turbulence distribution. Motion typically increases skewness.
-- **Kurtosis**: "Tailedness" of turbulence distribution. Motion produces heavier tails.
+**Higher-Order Moments (5)**:
+- **Skewness**: Asymmetry of turbulence distribution.
 
-**Robust Statistics (7, 9)**:
-- **Entropy**: High during motion (unpredictable), low during idle (stable)
-- **MAD**: Robust alternative to std, less sensitive to outliers
-
-**Temporal Structure (8, 10)**:
+**Temporal Structure (6)**:
 - **Autocorrelation**: Lag-1 temporal correlation. High during idle (smooth signal), low during motion (turbulent)
-- **Slope**: Positive = increasing turbulence, negative = decreasing
 
-**Temporal Variation (11)**:
+**Temporal Variation (8)**:
 - **Waveform Length**: Sum of absolute first differences over the turbulence window. Higher values indicate faster/more irregular short-term motion dynamics.
 
 #### Feature Importance
 
 SHAP and correlation can diverge significantly: correlation captures linear association with the label, while SHAP captures non-linear contribution inside the network.
 
-Updated values from `10_train_ml_model.py` (`--correlation` and `--shap`):
+Current SHAP ranking from `python tools/10_train_ml_model.py --shap`:
 
-| Rank (SHAP) | Feature | SHAP | Contribution | Corr |
-|-------------|---------|------|--------------|------|
-| 1 | `turb_autocorr` | 0.279470 | 39.3% | +0.9003 |
-| 2 | `turb_entropy` | 0.064995 | 9.1% | +0.1978 |
-| 3 | `turb_min` | 0.064498 | 9.1% | -0.5491 |
-| 4 | `turb_zcr` | 0.055212 | 7.8% | -0.8672 |
-| 5 | `waveform_length` | 0.050079 | 7.0% | +0.3834 |
-| 6 | `turb_kurtosis` | 0.049813 | 7.0% | -0.1761 |
-| 7 | `turb_std` | 0.047222 | 6.6% | +0.5847 |
-| 8 | `turb_mean` | 0.039395 | 5.5% | -0.2334 |
-| 9 | `turb_mad` | 0.021467 | 3.0% | +0.5704 |
-| 10 | `turb_slope` | 0.018362 | 2.6% | -0.0012 |
-| 11 | `turb_skewness` | 0.010923 | 1.5% | +0.3252 |
-| 12 | `turb_max` | 0.009818 | 1.4% | +0.1758 |
+| Rank | Feature | SHAP Value | Contribution |
+|------|---------|------------|--------------|
+| 1 | `turb_autocorr` | 0.160831 | 21.2% |
+| 2 | `turb_min` | 0.144832 | 19.1% |
+| 3 | `turb_max` | 0.142413 | 18.8% |
+| 4 | `turb_mad` | 0.103570 | 13.7% |
+| 5 | `waveform_length` | 0.070914 | 9.3% |
+| 6 | `turb_iqr` | 0.060648 | 8.0% |
+| 7 | `turb_mean` | 0.031777 | 4.2% |
+| 8 | `turb_std` | 0.025128 | 3.3% |
+| 9 | `turb_skewness` | 0.018483 | 2.4% |
+
+Current correlation ranking from `python tools/10_train_ml_model.py --correlation`:
+
+| Rank | Feature | Corr |
+|------|---------|------|
+| 1 | `turb_autocorr` | +0.7988 |
+| 2 | `turb_iqr` | +0.6547 |
+| 3 | `turb_mad` | +0.6538 |
+| 4 | `turb_std` | +0.6449 |
+| 5 | `turb_min` | -0.3906 |
+| 6 | `waveform_length` | +0.3719 |
+| 7 | `turb_max` | +0.3051 |
+| 8 | `turb_skewness` | +0.1175 |
+| 9 | `turb_mean` | -0.0806 |
 
 #### Feature Definitions
 
-**Zero-Crossing Rate**:
+**Interquartile Range (IQR)**:
 ```
-ZCR = count(sign(x[i] - μ) ≠ sign(x[i-1] - μ)) / (n - 1)
+IQR = P75(x) - P25(x)
 ```
-Counts how often the signal crosses the mean value. Ranges from 0.0 (monotonic) to 1.0 (alternating every sample).
+Measures the width of the middle 50% of the turbulence distribution. Unlike zero-crossing rate, it responds to spread without being dominated by rapid sign flips around the mean, which made it a better fit for suppressing quiet-window false positives in the current long-run validation set.
 
 **Skewness** (third standardized moment):
 ```
@@ -634,20 +663,6 @@ Counts how often the signal crosses the mean value. Ranges from 0.0 (monotonic) 
 - γ₁ > 0: Right-skewed (tail on right)
 - γ₁ < 0: Left-skewed (tail on left)
 - γ₁ = 0: Symmetric
-
-**Kurtosis** (fourth standardized moment, excess):
-```
-γ₂ = E[(X - μ)⁴] / σ⁴ - 3
-```
-- γ₂ > 0: Heavy tails (leptokurtic)
-- γ₂ < 0: Light tails (platykurtic)
-- γ₂ = 0: Normal distribution (mesokurtic)
-
-**Shannon Entropy**:
-```
-H = -Σ pᵢ × log₂(pᵢ)
-```
-Computed by binning turbulence values (10 bins) and calculating the entropy of the histogram. Higher entropy indicates more randomness/unpredictability.
 
 **Lag-1 Autocorrelation**:
 ```
@@ -659,13 +674,7 @@ Measures temporal correlation between consecutive values. Ranges from -1.0 to 1.
 ```
 MAD = median(|xᵢ - median(x)|)
 ```
-Robust measure of spread. Unlike std, a single outlier cannot dramatically inflate the MAD. Computed using insertion sort (efficient for n=75 on ESP32).
-
-**Linear Regression Slope**:
-```
-slope = Σ(iᵢ - ī)(xᵢ - x̄) / Σ(iᵢ - ī)²
-```
-Where i = time index, x = turbulence value. Positive slope indicates increasing motion intensity.
+Robust measure of spread. Unlike std, a single outlier cannot dramatically inflate the MAD. IQR and MAD share one sorted copy of the turbulence window per evaluation (`std::sort` in C++, `list.sort()` in MicroPython).
 
 **Waveform Length**:
 ```
@@ -687,7 +696,9 @@ The training pipeline includes:
 
 ### Performance
 
-ML achieves higher recall than MVS with a small tradeoff in precision. ML's strength is **generalization** -- it performs well across different environments without per-environment calibration.
+ML's strength is **generalization without runtime calibration**: it uses fixed subcarriers and pre-trained weights, so it can boot quickly and perform strongly on the paired real-data validation set.
+
+Historical experiment logs that informed the current production choices are collected in [EXPERIMENTS.md](EXPERIMENTS.md). This keeps the algorithm reference focused on the currently promoted pipeline while preserving the rationale behind rejected or superseded approaches.
 
 See [PERFORMANCE.md](../PERFORMANCE.md) for detailed per-chip results and [TUNING.md](../TUNING.md) for configuration and tuning guidance.
 

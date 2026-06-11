@@ -7,8 +7,8 @@
  * 1. Calculate spatial turbulence (std of subcarrier amplitudes) per packet
  * 2. Apply optional Hampel filter to remove outliers
  * 3. Apply optional low-pass filter for noise reduction
- * 4. Extract 12 statistical features from turbulence buffer
- * 5. Run MLP inference (12 -> 16 -> 8 -> 1)
+ * 4. Extract statistical features from turbulence buffer
+ * 5. Run MLP inference using exported architecture metadata
  * 6. Compare probability to threshold for motion detection
  * 
  * Author: Francesco Pace <francesco.pace@gmail.com>
@@ -29,6 +29,7 @@ constexpr float ML_DEFAULT_THRESHOLD = 5.0f;
 constexpr float ML_MIN_THRESHOLD = 0.0f;
 constexpr float ML_MAX_THRESHOLD = 10.0f;
 constexpr float ML_METRIC_SCALE = 10.0f;
+constexpr float ML_TEMPERATURE = 5.0f;
 
 /**
  * ML (Machine Learning) Detector
@@ -67,18 +68,22 @@ public:
     float get_threshold() const override { return threshold_; }
     const char* get_name() const override { return "ML"; }
 
+    // ML model is trained on raw std only — CV normalization must stay off
+    void set_cv_normalization(bool /*enabled*/) override {}
+
 private:
     /**
-     * Extract 12 features from turbulence buffer
+     * Extract ML features from the turbulence buffer
      */
     void extract_features(float* features_out);
     
     /**
-     * Run MLP inference on features
-     * 
-     * Architecture: 12 -> 16 (ReLU) -> 8 (ReLU) -> 1 (Sigmoid)
-     * 
-     * @param features Normalized feature vector (12 values)
+     * Run MLP inference on features.
+     *
+     * The hidden-layer layout is defined by the auto-generated
+     * `ml_weights.h` metadata rather than hardcoded in this class.
+     *
+     * @param features Feature vector expected by the exported model
      * @return Scaled motion metric (0.0-10.0, unified with MVS)
      */
     float predict(const float* features);

@@ -11,18 +11,22 @@ import network
 import time
 import gc
 import os
-from src.mvs_detector import MVSDetector
-from src.ml_detector import MLDetector
-from src.mqtt.handler import MQTTHandler
-from src.traffic_generator import TrafficGenerator
 import src.config as config
 
 # Gain lock configuration
 GAIN_LOCK_PACKETS = 300  # ~3 seconds at 100 Hz
+# Keep ML UI scaling constants local so ML code can be imported lazily.
+ML_DEFAULT_THRESHOLD = 5.0
+ML_METRIC_SCALE = 10.0
 
 # Import HT20 constants from config
 from src.config import NUM_SUBCARRIERS, EXPECTED_CSI_LEN, SEG_THRESHOLD
-from src.utils import to_signed_int8, calculate_median, normalize_ht20_csi_payload
+from src.utils import (
+    to_signed_int8,
+    calculate_median,
+    normalize_ht20_csi_payload,
+    csi_read_frame,
+)
 
 # Global state for calibration mode and performance metrics
 class GlobalState:
@@ -36,6 +40,12 @@ class GlobalState:
 
 
 g_state = GlobalState()
+
+
+def print_heap(label):
+    """Print a compact heap snapshot for boot/runtime profiling."""
+    gc.collect()
+    print(f"[MEM] {label}: free={gc.mem_free()} alloc={gc.mem_alloc()}")
 
 def cleanup_wifi(wlan):
     """
@@ -121,9 +131,6 @@ def connect_wifi():
     wlan.config(bandwidth=wlan.BW_HT20)          # HT20 for stable CSI
     wlan.config(promiscuous=False)               # CSI from connected AP only
     
-    # Enable CSI after WiFi is stable
-    wlan.csi_enable(buffer_size=config.CSI_BUFFER_SIZE)
-    
     # Connect (optionally locked to a specific BSSID)
     bssid_hex = getattr(config, 'WIFI_BSSID', None)
     bssid = None
@@ -146,6 +153,8 @@ def connect_wifi():
         print_wifi_status(wlan)
         # Disable power management
         wlan.config(pm=wlan.PM_NONE)
+        # Match the standalone smoke test: enable CSI only after the link is up.
+        wlan.csi_enable(buffer_size=config.CSI_BUFFER_SIZE)
         # Stabilization
         time.sleep(1)
         return wlan
@@ -157,17 +166,18 @@ def format_progress_bar(score, threshold, width=20, is_probability=False):
     """Format progress bar for console output.
     
     For MVS: score = metric/threshold, threshold_pos at 75% (15/20)
-    For ML: score = probability, threshold_pos at threshold (e.g., 50% for 0.5)
+    For ML: score/threshold are on the detector's 0-10 scale.
     """
     if is_probability:
-        # ML mode: threshold is a probability (0-1), show it at its actual position
-        threshold_pos = int(threshold * width)
-        filled = int(score * width)
+        # ML mode: threshold and score are already scaled to 0-10.
+        threshold_pos = int((threshold / ML_METRIC_SCALE) * width)
+        filled = int((score / ML_METRIC_SCALE) * width)
     else:
         # MVS mode: score is already normalized (metric/threshold)
         threshold_pos = 15  # 75% position
         filled = int(score * threshold_pos)
     
+    threshold_pos = max(0, min(threshold_pos, width - 1))
     filled = max(0, min(filled, width))
     
     bar = '['
@@ -180,7 +190,10 @@ def format_progress_bar(score, threshold, width=20, is_probability=False):
             bar += '░'
     bar += ']'
     
-    percent = int(score * 100)
+    if is_probability:
+        percent = int((score / threshold) * 100) if threshold > 0 else 0
+    else:
+        percent = int(score * 100)
     return f"{bar} {percent}%"
 
 
@@ -230,9 +243,11 @@ def run_gain_lock(wlan):
     fft_samples = []
     count = 0
     
+    frame_result = None
     while count < GAIN_LOCK_PACKETS:
-        frame = wlan.csi_read()
+        frame = csi_read_frame(wlan, frame_result)
         if frame:
+            frame_result = frame
             # frame[22] = agc_gain (uint8), frame[23] = fft_gain (int8 as uint8)
             agc_samples.append(frame[22])
             fft_samples.append(to_signed_int8(frame[23]))
@@ -277,7 +292,7 @@ def run_gain_lock(wlan):
     return median_agc, median_fft, False
 
 
-def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
+def run_band_calibration(wlan, detector, traffic_gen, chip_type=None, restart_traffic_gen=True):
     """
     Run band calibration with selected algorithm (with gain lock phase first)
     
@@ -286,6 +301,7 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
         detector: IDetector instance (MVSDetector or MLDetector)
         traffic_gen: TrafficGenerator instance
         chip_type: Chip type ('C5', 'C6', 'S3', etc.) for subcarrier filtering
+        restart_traffic_gen: Restart the traffic generator before returning
     
     Returns:
         bool: True if calibration successful
@@ -332,7 +348,7 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
         print('='*60)
         print('ML Quick Boot Complete!')
         print(f'   Subcarriers: {config.SELECTED_SUBCARRIERS}')
-        print(f'   Threshold: 0.5 (probability)')
+        print(f'   Threshold: {detector.get_threshold():.1f} (scaled 0-10 score)')
         print(f'   Total boot time: ~3 seconds (gain lock only)')
         print('='*60)
         print('')
@@ -394,12 +410,14 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
     collapse_logged = False
     remap_logged = False
     ht57_remap_buffer = bytearray(EXPECTED_CSI_LEN)
+    frame_result = None
     
     while calibration_progress < config.CALIBRATION_BUFFER_SIZE:
-        frame = wlan.csi_read()
+        frame = csi_read_frame(wlan, frame_result)
         packets_read += 1
         
         if frame:
+            frame_result = frame
             csi_data, raw_len, remap_tag = normalize_ht20_csi_payload(
                 frame[5], EXPECTED_CSI_LEN, remap_buffer=ht57_remap_buffer
             )
@@ -453,12 +471,16 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
         traffic_gen.stop()
         gc.collect()
     
+    nbvi_start_time = time.ticks_ms()
     try:
         # Calibrator returns: calibrate() -> (band, values)
         # band = selected subcarriers, values = mv_values
         selected_band, cal_values = calibrator.calibrate()
+        nbvi_elapsed_ms = time.ticks_diff(time.ticks_ms(), nbvi_start_time)
+        print(f"NBVI computation time: {nbvi_elapsed_ms / 1000:.2f}s")
     except Exception as e:
-        print(f"Error during calibration: {e}")
+        nbvi_elapsed_ms = time.ticks_diff(time.ticks_ms(), nbvi_start_time)
+        print(f"Error during calibration after {nbvi_elapsed_ms / 1000:.2f}s: {e}")
         selected_band, cal_values = None, []
     
     # Free calibrator memory BEFORE threshold calculation (C3 needs the headroom)
@@ -470,7 +492,7 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
         config.SELECTED_SUBCARRIERS = selected_band
         
         if is_ml:
-            threshold_source = "fixed (0.5)"
+            threshold_source = f"fixed ({detector.get_threshold():.1f})"
             success = True
             
             print('')
@@ -519,7 +541,7 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
         print('')
     
     # Restart traffic generator if it was running
-    if tg_was_running:
+    if tg_was_running and restart_traffic_gen:
         time.sleep(1)  # Wait for network stack to stabilize
         if not traffic_gen.start(config.TRAFFIC_GENERATOR_RATE):
             print("Warning: Failed to restart traffic generator, retrying...")
@@ -544,9 +566,24 @@ def get_chip_type():
     return machine
 
 
+def restart_traffic_generator(traffic_gen):
+    """Restart the traffic generator after calibration-sensitive work completes."""
+    if not traffic_gen or not config.TRAFFIC_GENERATOR_RATE:
+        return
+
+    time.sleep(1)  # Give WiFi/MQTT stack time to settle before reopening raw socket.
+    gc.collect()
+    if not traffic_gen.start(config.TRAFFIC_GENERATOR_RATE):
+        print("Warning: Failed to restart traffic generator, retrying...")
+        time.sleep(2)
+        gc.collect()
+        traffic_gen.start(config.TRAFFIC_GENERATOR_RATE)
+
+
 def main():
     """Main application loop"""
     print('Micro-ESPectre starting...')
+    print_heap('boot')
     
     # Detect chip type
     g_state.chip_type = get_chip_type()
@@ -554,6 +591,7 @@ def main():
     
     # Connect to WiFi
     wlan = connect_wifi()
+    print_heap('after_connect_wifi')
     
     # Initialize detector based on configured algorithm
     detection_algorithm = getattr(config, 'DETECTION_ALGORITHM', 'mvs').lower()
@@ -561,9 +599,10 @@ def main():
     
     if detection_algorithm == 'ml':
         print(f'Detection algorithm: ML (Neural Network)')
+        from src.ml_detector import MLDetector
         detector = MLDetector(
             window_size=config.SEG_WINDOW_SIZE,
-            threshold=0.5,  # Probability threshold
+            threshold=ML_DEFAULT_THRESHOLD,
             enable_lowpass=config.ENABLE_LOWPASS_FILTER,
             lowpass_cutoff=config.LOWPASS_CUTOFF,
             enable_hampel=config.ENABLE_HAMPEL_FILTER,
@@ -572,6 +611,7 @@ def main():
         )
     else:
         print(f'Detection algorithm: MVS (Moving Variance Segmentation)')
+        from src.mvs_detector import MVSDetector
         detector = MVSDetector(
             window_size=config.SEG_WINDOW_SIZE,
             threshold=initial_threshold if isinstance(initial_threshold, (int, float)) else 1.0,
@@ -581,10 +621,14 @@ def main():
             hampel_window=config.HAMPEL_WINDOW,
             hampel_threshold=config.HAMPEL_THRESHOLD
         )
+    print_heap('after_detector_init')
     
     # Initialize and start traffic generator (rate is static from config.py)
     gc.collect()  # Free memory before creating socket
-    traffic_gen = TrafficGenerator()
+    traffic_mode = getattr(config, 'TRAFFIC_GENERATOR_MODE', 'ping')
+    from src.traffic_generator import TrafficGenerator
+    traffic_gen = TrafficGenerator(mode=traffic_mode)
+    print_heap('after_traffic_gen_init')
     if config.TRAFFIC_GENERATOR_RATE > 0:
         if not traffic_gen.start(config.TRAFFIC_GENERATOR_RATE):
             print("FATAL: Traffic generator failed to start - CSI will not work")
@@ -593,7 +637,8 @@ def main():
             time.sleep(5)
             machine.reset()  # Reboot and retry
         
-        print(f'Traffic generator started ({config.TRAFFIC_GENERATOR_RATE} pps)')
+        print(f'Traffic generator started ({traffic_mode}, {config.TRAFFIC_GENERATOR_RATE} pps)')
+        print_heap('after_traffic_gen_start')
         
         # Verify CSI packets are flowing with retry logic
         max_tg_retries = 3
@@ -602,9 +647,11 @@ def main():
             
             print('Waiting for CSI packets...')
             csi_received = 0
+            frame_result = None
             for _ in range(100):  # Max 100 attempts (~5 seconds)
-                frame = wlan.csi_read()
+                frame = csi_read_frame(wlan, frame_result)
                 if frame:
+                    frame_result = frame
                     csi_received += 1
                     if csi_received >= 10:
                         break
@@ -623,6 +670,7 @@ def main():
                 print('Please check WiFi connection and retry')
                 import sys
                 sys.exit(1)
+        print_heap('after_csi_flow_check')
     
     # P95 Auto-Calibration at boot if subcarriers not configured
     # Handle case where SELECTED_SUBCARRIERS is None, empty, or not defined (commented out)
@@ -631,17 +679,30 @@ def main():
     
     if needs_calibration:
         # Set default fallback before calibration
-        run_band_calibration(wlan, detector, traffic_gen, g_state.chip_type)
+        run_band_calibration(wlan, detector, traffic_gen, g_state.chip_type, restart_traffic_gen=False)
     else:
         print(f'Using configured subcarriers: {config.SELECTED_SUBCARRIERS}')
+    print_heap('after_calibration')
     
-    # Initialize MQTT (pass calibration function for factory_reset and global state for metrics)
-    mqtt_handler = MQTTHandler(config, detector, wlan, traffic_gen, run_band_calibration, g_state)
-    mqtt_handler.connect()
-    
-    # Publish info after boot (always, to show current configuration)
-    #print('Publishing system info...')
-    mqtt_handler.publish_info()
+    mqtt_enabled = getattr(config, 'MQTT_ENABLED', True)
+    mqtt_handler = None
+    if mqtt_enabled:
+        # Initialize MQTT (pass calibration function for factory_reset and global state for metrics)
+        from src.mqtt.handler import MQTTHandler
+        mqtt_handler = MQTTHandler(config, detector, wlan, traffic_gen, run_band_calibration, g_state)
+        print_heap('after_mqtt_handler_init')
+        mqtt_handler.connect()
+        print_heap('after_mqtt_connect')
+        
+        # Publish info after boot (always, to show current configuration)
+        #print('Publishing system info...')
+        mqtt_handler.publish_info()
+        print_heap('after_publish_info')
+    else:
+        print('MQTT disabled')
+
+    if config.TRAFFIC_GENERATOR_RATE > 0 and not traffic_gen.is_running():
+        restart_traffic_generator(traffic_gen)
     
     print('')
     print('  __  __ _                    _____ ____  ____            _            ')
@@ -659,15 +720,24 @@ def main():
     
     # Main CSI processing loop with integrated MQTT publishing
     publish_counter = 0
+    mqtt_poll_counter = 0
     last_dropped = 0
     filtered_count = 0  # Packets with wrong SC count
     last_publish_time = time.ticks_ms()
     collapse_logged = False
     remap_logged = False
     ht57_remap_buffer = bytearray(EXPECTED_CSI_LEN)
+    frame_result = None
     
-    # Calculate optimal sleep based on traffic rate
-    publish_rate = traffic_gen.get_rate() if traffic_gen.is_running() else 100
+    publish_rate = getattr(config, 'PUBLISH_INTERVAL', None)
+    if publish_rate is None:
+        publish_rate = traffic_gen.get_rate() if traffic_gen.is_running() else 100
+    from src.runtime_policy import RuntimeMotionPolicy
+    runtime_policy = RuntimeMotionPolicy(
+        evaluation_interval=getattr(config, 'EVALUATION_INTERVAL', 25),
+        motion_on_hits=getattr(config, 'MOTION_ON_HITS', 3),
+        motion_off_hits=getattr(config, 'MOTION_OFF_HITS', 3),
+    )
        
     try:
         while True:
@@ -678,12 +748,10 @@ def main():
                 time.sleep_ms(1000) # Sleep for 1 second to yield CPU
                 continue
             
-            # Check MQTT messages (non-blocking)
-            mqtt_handler.check_messages()
-            
-            frame = wlan.csi_read()
+            frame = csi_read_frame(wlan, frame_result)
             
             if frame:
+                frame_result = frame
                 csi_data, raw_len, remap_tag = normalize_ht20_csi_payload(
                     frame[5], EXPECTED_CSI_LEN, remap_buffer=ht57_remap_buffer
                 )
@@ -707,53 +775,67 @@ def main():
                 
                 # Process packet through detector interface
                 detector.process_packet(csi_data, config.SELECTED_SUBCARRIERS)
+
+                # Poll MQTT commands every 10 packets to reduce hot-loop overhead
+                # without making command responsiveness noticeable to users.
+                if mqtt_handler is not None:
+                    mqtt_poll_counter += 1
+                    if mqtt_poll_counter >= 10:
+                        mqtt_handler.check_messages()
+                        mqtt_poll_counter = 0
                 
                 publish_counter += 1
+                runtime_policy.note_packet()
+                should_publish = publish_counter >= publish_rate
                 
-                # Publish every N packets (where N = publish_rate)
-                if publish_counter >= publish_rate:
+                if runtime_policy.should_evaluate(should_publish):
                     # Detect WiFi channel changes (AP may switch channels automatically)
                     # Channel changes cause CSI spikes that trigger false motion detection
                     if g_state.current_channel != 0 and packet_channel != g_state.current_channel:
                         print(f"[WARN] WiFi channel changed: {g_state.current_channel} -> {packet_channel}, resetting detection buffer")
                         detector.reset()
+                        runtime_policy.reset()
                     g_state.current_channel = packet_channel
                     
-                    # Update state (lazy evaluation)
                     metrics = detector.update_state()
-                    current_time = time.ticks_ms()
-                    time_delta = time.ticks_diff(current_time, last_publish_time)
-                    
-                    # Calculate packets per second
-                    pps = int((publish_counter * 1000) / time_delta) if time_delta > 0 else 0
-                    
-                    dropped = wlan.csi_dropped()
-                    dropped_delta = dropped - last_dropped
-                    last_dropped = dropped
-                    
-                    state_str = 'MOTION' if metrics['state'] == 1 else 'IDLE'
-                    motion_metric = metrics.get('moving_variance', metrics.get('jitter', metrics.get('probability', 0)))
-                    threshold = metrics['threshold']
-                    is_ml = 'probability' in metrics
-                    # For ML, probability and threshold are both 0-1, so progress = probability
-                    if is_ml:
-                        progress = motion_metric  # probability is already 0-1
-                    else:
-                        progress = motion_metric / threshold if threshold > 0 else 0
-                    progress_bar = format_progress_bar(progress, threshold, is_probability=is_ml)
-                    print(f"{progress_bar} | pkts:{publish_counter} drop:{dropped_delta} pps:{pps} | "
-                          f"mvmt:{motion_metric:.4f} thr:{threshold:.4f} | {state_str}")
-                    
-                    mqtt_handler.publish_state(
-                        motion_metric,
-                        metrics['state'],
-                        threshold,
-                        publish_counter,
-                        dropped_delta,
-                        pps
-                    )
-                    publish_counter = 0
-                    last_publish_time = current_time
+                    effective_state, _ = runtime_policy.apply_state(metrics['state'])
+                    runtime_policy.after_evaluation()
+
+                    if should_publish:
+                        current_time = time.ticks_ms()
+                        time_delta = time.ticks_diff(current_time, last_publish_time)
+                        
+                        # Calculate packets per second
+                        pps = int((publish_counter * 1000) / time_delta) if time_delta > 0 else 0
+                        
+                        dropped = wlan.csi_dropped()
+                        dropped_delta = dropped - last_dropped
+                        last_dropped = dropped
+                        
+                        state_str = 'MOTION' if effective_state == 1 else 'IDLE'
+                        motion_metric = metrics.get('moving_variance', metrics.get('jitter', metrics.get('probability', 0)))
+                        threshold = metrics['threshold']
+                        is_ml = 'probability' in metrics
+                        # For ML, motion_metric and threshold are both on the detector's 0-10 scale.
+                        if is_ml:
+                            progress = motion_metric
+                        else:
+                            progress = motion_metric / threshold if threshold > 0 else 0
+                        progress_bar = format_progress_bar(progress, threshold, is_probability=is_ml)
+                        print(f"{progress_bar} | pkts:{publish_counter} drop:{dropped_delta} pps:{pps} | "
+                              f"mvmt:{motion_metric:.4f} thr:{threshold:.4f} | {state_str}")
+                        
+                        if mqtt_handler is not None:
+                            mqtt_handler.publish_state(
+                                motion_metric,
+                                effective_state,
+                                threshold,
+                                publish_counter,
+                                dropped_delta,
+                                pps
+                            )
+                        publish_counter = 0
+                        last_publish_time = current_time
 
                 # Update loop time metric
                 g_state.loop_time_us = time.ticks_diff(time.ticks_us(), loop_start)
@@ -770,7 +852,8 @@ def main():
     
     finally:
         print('Cleaning up...')
-        mqtt_handler.disconnect()        
+        if mqtt_handler is not None:
+            mqtt_handler.disconnect()
         if traffic_gen.is_running():
             traffic_gen.stop()
         cleanup_wifi(wlan)
